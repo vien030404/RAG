@@ -1,0 +1,284 @@
+# ============================================================================
+# Lakehouse Pipeline - infrastructure (Docker Compose)
+#
+#   MinIO (raw + warehouse)  ->  Iceberg REST Catalog  ->  Trino
+#   Postgres (shared metadata: iceberg / airflow)
+#   Airflow (orchestration)
+#
+# All tunables live in .env (copy from .env.example).
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# Shared Airflow definition (LocalExecutor)
+# ---------------------------------------------------------------------------
+x-airflow-common: &airflow-common
+  build:
+    context: ./airflow
+    args:
+      AIRFLOW_VERSION: ${AIRFLOW_VERSION}
+  image: airflow:${AIRFLOW_VERSION}
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@postgres:5432/${AIRFLOW_DB}
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY}
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session"
+    # Connection details for the lakehouse, available to DAGs as env vars
+    LAKEHOUSE_TRINO_HOST: trino
+    LAKEHOUSE_TRINO_PORT: "8080"
+    LAKEHOUSE_S3_ENDPOINT: http://minio:9000
+    LAKEHOUSE_ICEBERG_REST_URI: http://iceberg-rest:8181
+    LAKEHOUSE_ICEBERG_WAREHOUSE: s3://${MINIO_WAREHOUSE_BUCKET}/
+    AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+    AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+    AWS_REGION: ${AWS_REGION}
+    LAKEHOUSE_DOCKER_NETWORK: ${COMPOSE_PROJECT_NAME:-project-1}_lakehouse
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/logs:/opt/airflow/logs
+    - ./airflow/plugins:/opt/airflow/plugins
+    - ./airflow/config:/opt/airflow/config
+    # Lets the DockerOperator launch the crawler as a sibling container.
+    - /var/run/docker.sock:/var/run/docker.sock
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    postgres:
+      condition: service_healthy
+  networks:
+    - lakehouse
+
+services:
+  # =========================================================================
+  # Shared metadata store
+  # =========================================================================
+  postgres:
+    image: postgres:${POSTGRES_VERSION}
+    container_name: postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: postgres
+      # consumed by ./postgres/init/01-create-databases.sh
+      ICEBERG_CATALOG_DB: ${ICEBERG_CATALOG_DB}
+      ICEBERG_CATALOG_USER: ${ICEBERG_CATALOG_USER}
+      ICEBERG_CATALOG_PASSWORD: ${ICEBERG_CATALOG_PASSWORD}
+      AIRFLOW_DB: ${AIRFLOW_DB}
+      AIRFLOW_DB_USER: ${AIRFLOW_DB_USER}
+      AIRFLOW_DB_PASSWORD: ${AIRFLOW_DB_PASSWORD}
+    ports:
+      - "${POSTGRES_PORT}:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - lakehouse
+    restart: unless-stopped
+
+  # =========================================================================
+  # Object storage (S3-compatible)
+  # =========================================================================
+  minio:
+    image: minio/minio:${MINIO_VERSION}
+    container_name: minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_REGION: ${AWS_REGION}
+    ports:
+      - "${MINIO_API_PORT}:9000"      # S3 API
+      - "${MINIO_CONSOLE_PORT}:9001"  # Web console
+    volumes:
+      - minio-data:/data
+    networks:
+      - lakehouse
+    restart: unless-stopped
+
+  # Creates buckets once MinIO is reachable, then exits.
+  minio-init:
+    image: minio/mc:${MINIO_MC_VERSION}
+    container_name: minio-init
+    depends_on:
+      minio:
+        condition: service_started
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_WAREHOUSE_BUCKET: ${MINIO_WAREHOUSE_BUCKET}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        until mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"; do
+          echo "Waiting for MinIO to be ready..."; sleep 2;
+        done
+        mc mb --ignore-existing local/"$$MINIO_WAREHOUSE_BUCKET"
+        echo "Bucket ready: $$MINIO_WAREHOUSE_BUCKET"
+    networks:
+      - lakehouse
+    restart: "no"
+
+  # =========================================================================
+  # Iceberg REST Catalog (JDBC/Postgres backend, MinIO warehouse)
+  # =========================================================================
+  iceberg-rest:
+    build:
+      context: ./iceberg-rest
+      args:
+        ICEBERG_REST_VERSION: ${ICEBERG_REST_VERSION}
+        POSTGRES_JDBC_VERSION: ${POSTGRES_JDBC_VERSION}
+    image: iceberg-rest:${ICEBERG_REST_VERSION}
+    container_name: iceberg-rest
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      AWS_REGION: ${AWS_REGION}
+      CATALOG_WAREHOUSE: s3://${MINIO_WAREHOUSE_BUCKET}/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+      CATALOG_CATALOG__IMPL: org.apache.iceberg.jdbc.JdbcCatalog
+      CATALOG_URI: jdbc:postgresql://postgres:5432/${ICEBERG_CATALOG_DB}
+      CATALOG_JDBC_USER: ${ICEBERG_CATALOG_USER}
+      CATALOG_JDBC_PASSWORD: ${ICEBERG_CATALOG_PASSWORD}
+    ports:
+      - "${ICEBERG_REST_PORT}:8181"
+    networks:
+      - lakehouse
+    restart: unless-stopped
+
+  # =========================================================================
+  # Query engine
+  # =========================================================================
+  trino:
+    image: trinodb/trino:${TRINO_VERSION}
+    container_name: trino
+    depends_on:
+      iceberg-rest:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      # Consumed by trino/etc/catalog/iceberg.properties via ${ENV:...}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - ./trino/etc:/etc/trino:ro
+      - trino-data:/data/trino
+    ports:
+      - "${TRINO_PORT}:8080"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/v1/info').status==200 else 1)"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - lakehouse
+    restart: unless-stopped
+
+  # =========================================================================
+  # Ingestion (web crawler -> Iceberg Bronze)
+  # One-shot job. NOT started by `docker compose up` (guarded by a profile).
+  # Run on demand:  docker compose run --rm --no-deps crawler
+  # =========================================================================
+  crawler:
+    build:
+      context: ./crawler
+    image: crawler:0.1
+    container_name: crawler
+    profiles: ["crawler"]
+    depends_on:
+      iceberg-rest:
+        condition: service_started
+    environment:
+      # Iceberg REST catalog + MinIO warehouse (Bronze table)
+      ICEBERG_REST_URI: http://iceberg-rest:8181
+      ICEBERG_WAREHOUSE: s3://${MINIO_WAREHOUSE_BUCKET}/
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      AWS_REGION: ${AWS_REGION}
+      BRONZE_NAMESPACE: bronze
+      BRONZE_TABLE: vnexpress_articles
+      # Optional scope control (defaults: all categories, today):
+      #   CRAWL_CATEGORIES: "Kinh doanh,Thế giới"   # comma-separated names from config.py
+      #   CRAWL_DATE: "2026-07-02"                    # ISO date
+    networks:
+      - lakehouse
+    restart: "no"
+
+  # =========================================================================
+  # Orchestration (Airflow, LocalExecutor)
+  # =========================================================================
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username "${AIRFLOW_ADMIN_USER}" --password "${AIRFLOW_ADMIN_PASSWORD}" \
+          --firstname Admin --lastname User --role Admin --email admin@example.com || true
+    restart: "no"
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    command: webserver
+    ports:
+      - "${AIRFLOW_PORT}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  pg-data:
+  minio-data:
+  trino-data:
+
+networks:
+  lakehouse:
+    driver: bridge

@@ -1,0 +1,8 @@
+# Airflow providers + clients used by the lakehouse DAGs.
+# Versions are left unpinned so pip resolves them against the base
+# Airflow constraint set; pin these once the pipeline stabilizes.
+apache-airflow-providers-trino
+apache-airflow-providers-amazon
+apache-airflow-providers-docker
+trino
+minio
