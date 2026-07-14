@@ -114,6 +114,7 @@ services:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
       MINIO_WAREHOUSE_BUCKET: ${MINIO_WAREHOUSE_BUCKET}
+      MINIO_RAW_BUCKET: ${MINIO_RAW_BUCKET}
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
@@ -121,8 +122,10 @@ services:
         until mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"; do
           echo "Waiting for MinIO to be ready..."; sleep 2;
         done
-        mc mb --ignore-existing local/"$$MINIO_WAREHOUSE_BUCKET"
-        echo "Bucket ready: $$MINIO_WAREHOUSE_BUCKET"
+        for b in "$$MINIO_WAREHOUSE_BUCKET" "$$MINIO_RAW_BUCKET"; do
+          mc mb --ignore-existing local/"$$b"
+          echo "Bucket ready: $$b"
+        done
     networks:
       - lakehouse
     restart: "no"
@@ -214,10 +217,13 @@ services:
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
       AWS_REGION: ${AWS_REGION}
       BRONZE_NAMESPACE: bronze
-      BRONZE_TABLE: vnexpress_articles
-      # Optional scope control (defaults: all categories, today):
-      #   CRAWL_CATEGORIES: "Kinh doanh,Thế giới"   # comma-separated names from config.py
-      #   CRAWL_DATE: "2026-07-02"                    # ISO date
+      BRONZE_TABLE: articles
+      # Raw zone: gzipped source HTML lands here (object store, not Iceberg)
+      RAW_BUCKET: ${MINIO_RAW_BUCKET}
+      # Optional scope control (defaults: all sources, all categories, today):
+      #   CRAWL_SOURCES: "vnexpress,tuoitre"          # comma-separated source names
+      #   CRAWL_CATEGORIES: "Kinh doanh,Thế giới"     # comma-separated category names
+      #   CRAWL_DATE: "2026-07-02"                     # ISO date
     networks:
       - lakehouse
     restart: "no"

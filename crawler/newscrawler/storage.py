@@ -1,20 +1,29 @@
-"""Ghi bài báo trực tiếp vào bảng Iceberg tầng Bronze.
+"""Ghi bài báo trực tiếp vào bảng Iceberg tầng Bronze (thống nhất mọi nguồn).
 
-Bảng: <BRONZE_NAMESPACE>.<BRONZE_TABLE> (mặc định bronze.vnexpress_articles),
+Bảng: <BRONZE_NAMESPACE>.<BRONZE_TABLE> (mặc định bronze.articles),
 lưu trong warehouse trên MinIO, quản lý qua Iceberg REST Catalog. Mỗi lần
-crawl 1 chuyên mục → 1 lần append (1 snapshot) vào bảng.
+crawl 1 chuyên mục (1 nguồn) → 1 lần append (1 snapshot) vào bảng; phân biệt
+nguồn qua cột `source`.
 """
 import os
+import time
 from datetime import date, datetime, timezone
 
 import pyarrow as pa
 from pyiceberg.catalog.rest import RestCatalog
-from pyiceberg.exceptions import NamespaceAlreadyExistsError, NoSuchTableError
+from pyiceberg.exceptions import (
+    CommitFailedException,
+    NamespaceAlreadyExistsError,
+    NoSuchTableError,
+    TableAlreadyExistsError,
+)
 
-from .parser import Article
+from .article import Article
+
+_COMMIT_RETRIES = 5
 
 BRONZE_NAMESPACE = os.getenv("BRONZE_NAMESPACE", "bronze")
-BRONZE_TABLE = os.getenv("BRONZE_TABLE", "vnexpress_articles")
+BRONZE_TABLE = os.getenv("BRONZE_TABLE", "articles")
 TABLE_IDENT = f"{BRONZE_NAMESPACE}.{BRONZE_TABLE}"
 
 # Explicit Arrow schema → stable Iceberg schema, independent of batch contents
@@ -33,15 +42,11 @@ SCHEMA = pa.schema([
     ("word_count", pa.int64()),
     ("thumbnail_url", pa.string()),
     ("author_name", pa.string()),
-    ("author_email", pa.string()),
     ("source_attribution", pa.string()),
     ("published_at", pa.timestamp("us", tz="UTC")),
-    ("updated_at", pa.timestamp("us", tz="UTC")),
     ("crawled_at", pa.timestamp("us", tz="UTC")),
-    ("raw_date", pa.date32()),
     ("source", pa.string()),
     ("crawl_status", pa.string()),
-    ("http_status", pa.int64()),
 ])
 
 _catalog = None
@@ -75,7 +80,11 @@ def _ensure_table(catalog: RestCatalog):
     try:
         return catalog.load_table(TABLE_IDENT)
     except NoSuchTableError:
-        return catalog.create_table(TABLE_IDENT, schema=SCHEMA)
+        try:
+            return catalog.create_table(TABLE_IDENT, schema=SCHEMA)
+        except TableAlreadyExistsError:
+            # 1 task nguồn song song vừa tạo bảng trước -> load lại
+            return catalog.load_table(TABLE_IDENT)
 
 
 def _utc(dt: datetime | None) -> datetime | None:
@@ -101,15 +110,11 @@ def _to_row(a: Article) -> dict:
         "word_count": a.word_count,
         "thumbnail_url": a.thumbnail_url,
         "author_name": a.author_name,
-        "author_email": a.author_email,
         "source_attribution": a.source_attribution,
         "published_at": _utc(a.published_at),
-        "updated_at": _utc(a.updated_at),
         "crawled_at": _utc(a.crawled_at),
-        "raw_date": a.raw_date,
         "source": a.source,
         "crawl_status": a.crawl_status,
-        "http_status": a.http_status,
     }
 
 
@@ -134,6 +139,17 @@ def save_articles(
     arrow_table = pa.Table.from_pylist(rows, schema=SCHEMA)
 
     catalog = _catalog_conn()
-    table = _ensure_table(catalog)
-    table.append(arrow_table)
-    return len(rows)
+    _ensure_table(catalog)  # đảm bảo namespace + bảng tồn tại
+
+    # Nhiều task nguồn có thể append song song vào cùng bảng -> commit có thể
+    # xung đột (CAS trên REST catalog). Reload metadata mới nhất & thử lại.
+    last_err: Exception | None = None
+    for attempt in range(_COMMIT_RETRIES):
+        try:
+            table = catalog.load_table(TABLE_IDENT)
+            table.append(arrow_table)
+            return len(rows)
+        except CommitFailedException as e:
+            last_err = e
+            time.sleep(0.5 * (attempt + 1))
+    raise last_err  # hết lượt retry vẫn xung đột

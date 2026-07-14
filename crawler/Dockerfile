@@ -1,7 +1,8 @@
 # ============================================================================
-# VnExpress news crawler for the lakehouse `raw` zone.
-# Runs as a one-shot job (crawl categories -> write Parquet to MinIO),
-# invoked manually (`docker compose run --rm crawler`) or by Airflow later.
+# Multi-source Vietnamese news crawler (vnexpress, vietnamnet, tuoitre,
+# thanhnien, dantri). Saves raw gzipped HTML to the `raw` bucket, then writes
+# parsed rows to Iceberg Bronze (`bronze.articles`). One-shot job, invoked
+# manually (`docker compose run --rm crawler`) or by Airflow.
 # ============================================================================
 FROM python:3.12-slim
 

@@ -1,22 +1,8 @@
-BASE_URL = "https://vnexpress.net"
+"""Cấu hình chung cho crawler đa nguồn.
 
-CATEGORIES = {
-    "Thời sự":              f"{BASE_URL}/thoi-su",
-    "Thế giới":             f"{BASE_URL}/the-gioi",
-    "Kinh doanh":           f"{BASE_URL}/kinh-doanh",
-    "Khoa học công nghệ":   f"{BASE_URL}/khoa-hoc",
-    "Bất động sản":         f"{BASE_URL}/bat-dong-san",
-    "Sức khỏe":             f"{BASE_URL}/suc-khoe",
-    "Giải trí":             f"{BASE_URL}/giai-tri",
-    "Thể thao":             f"{BASE_URL}/the-thao",
-    "Pháp luật":            f"{BASE_URL}/phap-luat",
-    "Giáo dục":             f"{BASE_URL}/giao-duc",
-    "Đời sống":             f"{BASE_URL}/doi-song",
-    "Xe":                   f"{BASE_URL}/oto-xe-may",
-    "Du lịch":              f"{BASE_URL}/du-lich",
-    "Tâm sự":               f"{BASE_URL}/tam-su",
-    "Thư giãn":             f"{BASE_URL}/thu-gian",
-}
+Danh mục (categories) của từng báo nằm trong lớp source tương ứng ở
+`newscrawler/sources/`. File này chỉ giữ thiết lập dùng chung.
+"""
 
 HEADERS = {
     "User-Agent": (
@@ -28,7 +14,14 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-REQUEST_DELAY = 1.5   # seconds between requests
-REQUEST_TIMEOUT = 15  # seconds
+REQUEST_DELAY = 1.0    # giây nghỉ giữa các request (lịch sự với server)
+REQUEST_TIMEOUT = 15   # giây
 MAX_RETRIES = 3
-MAX_PAGES = 10        # giới hạn an toàn số trang mỗi category
+
+# Phạm vi crawl
+MAX_PAGES = 10   # số trang listing / category (0 hoặc None = không cào; >=1)
+# Không giới hạn số bài mỗi category (lấy hết bài trên mỗi trang listing).
+
+# Bỏ bài không có nội dung text (video / trang không phải bài viết).
+# Bài thật luôn > vài trăm ký tự; video parse ra content rỗng.
+MIN_CONTENT_LEN = 100

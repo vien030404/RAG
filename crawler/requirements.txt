@@ -3,4 +3,5 @@ urllib3==2.2.3
 beautifulsoup4==4.12.3
 lxml==5.3.0
 pyiceberg[pyarrow]==0.8.1
+boto3==1.35.36
 python-dotenv==1.0.1

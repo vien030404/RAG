@@ -11,22 +11,24 @@ Crawler ─▶ Iceberg Bronze ─▶ dbt+Trino ─▶ Iceberg Silver ─▶ dbt+
 ```
 
 > **Status:** infrastructure layer is up and verified. The **crawler**
-> (`crawler/`) is a working VnExpress news crawler that writes **directly into
-> the Iceberg Bronze table** `bronze.vnexpress_articles` (queryable via Trino) —
-> see [crawler/README.md](crawler/README.md). The **dbt** transformation layer
-> (`dbt/`, Silver→Gold) is still a placeholder, to be built next.
+> (`crawler/`) is a working **multi-source** news crawler (VnExpress, VietnamNet,
+> Tuổi Trẻ, Thanh Niên, Dân trí): it saves **gzipped raw HTML** to the `raw`
+> bucket and writes parsed rows to the unified Iceberg Bronze table
+> `bronze.articles` (queryable via Trino) — see [crawler/README.md](crawler/README.md).
+> The **dbt** transformation layer (`dbt/`, Silver→Gold) is still a placeholder,
+> to be built next.
 
 ## Components
 
 | Service         | Role                                             | URL / Port (host)            |
 | --------------- | ------------------------------------------------ | ---------------------------- |
 | `postgres`      | Shared metadata (Iceberg catalog, Airflow)       | `localhost:5432`             |
-| `minio`         | S3-compatible object storage (Iceberg `warehouse`)| `localhost:9000` (API), `9001` (console) |
-| `minio-init`    | Creates the `warehouse` bucket, then exits        | —                       |
+| `minio`         | S3-compatible object storage (`warehouse` + `raw`) | `localhost:9000` (API), `9001` (console) |
+| `minio-init`    | Creates the `warehouse` + `raw` buckets, then exits | —                       |
 | `iceberg-rest`  | Iceberg REST Catalog (`apache/iceberg-rest-fixture` + Postgres JDBC backend, MinIO storage) | `localhost:8181` |
 | `trino`         | SQL query engine (Iceberg connector)             | `localhost:8080`             |
 | `airflow-*`     | Orchestration (LocalExecutor)                     | `localhost:8085`            |
-| `crawler`       | Web crawler → Iceberg Bronze (on-demand job, profile `crawler`) | — (see [crawler/](crawler/)) |
+| `crawler`       | Multi-source news crawler → raw HTML + Iceberg Bronze (on-demand, profile `crawler`) | — (see [crawler/](crawler/)) |
 
 ## Prerequisites
 
