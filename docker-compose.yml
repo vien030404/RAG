@@ -1,7 +1,7 @@
 # ============================================================================
-# Lakehouse Pipeline - infrastructure (Docker Compose)
+# News Crawler -> RAG - infrastructure (Docker Compose)
 #
-#   MinIO (raw + warehouse)  ->  Iceberg REST Catalog  ->  Trino
+#   Crawler  ->  MinIO (raw + warehouse)  <-  Iceberg REST Catalog
 #   Postgres (shared metadata: iceberg / airflow)
 #   Airflow (orchestration)
 #
@@ -27,9 +27,7 @@ x-airflow-common: &airflow-common
     AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
     AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session"
-    # Connection details for the lakehouse, available to DAGs as env vars
-    LAKEHOUSE_TRINO_HOST: trino
-    LAKEHOUSE_TRINO_PORT: "8080"
+    # Connection details for the data stack, available to DAGs as env vars
     LAKEHOUSE_S3_ENDPOINT: http://minio:9000
     LAKEHOUSE_ICEBERG_REST_URI: http://iceberg-rest:8181
     LAKEHOUSE_ICEBERG_WAREHOUSE: s3://${MINIO_WAREHOUSE_BUCKET}/
@@ -37,6 +35,19 @@ x-airflow-common: &airflow-common
     AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
     AWS_REGION: ${AWS_REGION}
     LAKEHOUSE_DOCKER_NETWORK: ${COMPOSE_PROJECT_NAME:-project-1}_lakehouse
+    # RAG — DAG truyền tiếp xuống container embed (task `embed`)
+    LAKEHOUSE_QDRANT_URL: http://qdrant:6333
+    QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+    QDRANT_COLLECTION: ${QDRANT_COLLECTION:-news_chunks}
+    GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    GEMINI_API_KEYS: ${GEMINI_API_KEYS:-}
+    GEMINI_KEY_COOLDOWN: ${GEMINI_KEY_COOLDOWN:-60}
+    GEMINI_TPM_LIMIT: ${GEMINI_TPM_LIMIT:-30000}
+    GEMINI_TPM_SAFETY: ${GEMINI_TPM_SAFETY:-0.8}
+    GEMINI_RPM_LIMIT: ${GEMINI_RPM_LIMIT:-100}
+    EMBED_BATCH: ${EMBED_BATCH:-40}
+    GEMINI_EMBED_MODEL: ${GEMINI_EMBED_MODEL:-gemini-embedding-001}
+    EMBED_DIM: ${EMBED_DIM:-768}
   volumes:
     - ./airflow/dags:/opt/airflow/dags
     - ./airflow/logs:/opt/airflow/logs
@@ -165,7 +176,34 @@ services:
     restart: unless-stopped
 
   # =========================================================================
-  # Query engine
+  # Vector store (RAG) — embeddings của chunk bài báo + metadata để lọc
+  # =========================================================================
+  qdrant:
+    image: qdrant/qdrant:${QDRANT_VERSION}
+    container_name: qdrant
+    environment:
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:-}
+      QDRANT__LOG_LEVEL: INFO
+    ports:
+      - "${QDRANT_HTTP_PORT}:6333"   # REST + dashboard (/dashboard)
+      - "${QDRANT_GRPC_PORT}:6334"   # gRPC
+    volumes:
+      - qdrant-data:/qdrant/storage
+    healthcheck:
+      # image không có curl/wget -> dùng bash mở TCP socket
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/6333'"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - lakehouse
+    restart: unless-stopped
+
+  # =========================================================================
+  # SQL engine — truy vấn Iceberg bằng SQL chuẩn.
+  # Cắm DBeaver / bất kỳ SQL client nào vào jdbc:trino://localhost:8080
+  # (user bất kỳ, không mật khẩu). Hoặc CLI: docker exec -it trino trino
   # =========================================================================
   trino:
     image: trinodb/trino:${TRINO_VERSION}
@@ -176,7 +214,7 @@ services:
       minio-init:
         condition: service_completed_successfully
     environment:
-      # Consumed by trino/etc/catalog/iceberg.properties via ${ENV:...}
+      # Đọc bởi trino/etc/catalog/iceberg.properties qua ${ENV:...}
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
     volumes:
@@ -218,6 +256,21 @@ services:
       AWS_REGION: ${AWS_REGION}
       BRONZE_NAMESPACE: bronze
       BRONZE_TABLE: articles
+      # RAG: chunk + embed (Gemini) -> Qdrant
+      #   docker compose run --rm crawler -m newscrawler.embed
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-news_chunks}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_API_KEYS: ${GEMINI_API_KEYS:-}
+      GEMINI_KEY_COOLDOWN: ${GEMINI_KEY_COOLDOWN:-60}
+      GEMINI_TPM_LIMIT: ${GEMINI_TPM_LIMIT:-30000}
+      GEMINI_TPM_SAFETY: ${GEMINI_TPM_SAFETY:-0.8}
+      GEMINI_RPM_LIMIT: ${GEMINI_RPM_LIMIT:-100}
+      EMBED_BATCH: ${EMBED_BATCH:-40}
+      GEMINI_EMBED_MODEL: ${GEMINI_EMBED_MODEL:-gemini-embedding-001}
+      GEMINI_CHAT_MODEL: ${GEMINI_CHAT_MODEL:-gemini-flash-latest}
+      EMBED_DIM: ${EMBED_DIM:-768}
       # Raw zone: gzipped source HTML lands here (object store, not Iceberg)
       RAW_BUCKET: ${MINIO_RAW_BUCKET}
       # Optional scope control (defaults: all sources, all categories, today):
@@ -227,6 +280,57 @@ services:
     networks:
       - lakehouse
     restart: "no"
+
+  # =========================================================================
+  # Giao dien hoi-dap (Streamlit) — cung image voi crawler
+  #   docker compose --profile chat up -d chatbot   ->  http://localhost:8501
+  # =========================================================================
+  chatbot:
+    image: crawler:0.1
+    container_name: chatbot
+    profiles: ["chat"]
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      iceberg-rest:
+        condition: service_started
+    # ENTRYPOINT cua image la `python`, nen chi can truyen phan con lai.
+    command:
+      - -m
+      - streamlit
+      - run
+      - chat_app.py
+      - --server.address=0.0.0.0
+      - --server.port=8501
+      - --server.headless=true
+      - --browser.gatherUsageStats=false
+    environment:
+      ICEBERG_REST_URI: http://iceberg-rest:8181
+      ICEBERG_WAREHOUSE: s3://${MINIO_WAREHOUSE_BUCKET}/
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      AWS_REGION: ${AWS_REGION}
+      BRONZE_NAMESPACE: bronze
+      BRONZE_TABLE: articles
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-news_chunks}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_API_KEYS: ${GEMINI_API_KEYS:-}
+      GEMINI_KEY_COOLDOWN: ${GEMINI_KEY_COOLDOWN:-60}
+      GEMINI_TPM_LIMIT: ${GEMINI_TPM_LIMIT:-30000}
+      GEMINI_TPM_SAFETY: ${GEMINI_TPM_SAFETY:-0.8}
+      GEMINI_RPM_LIMIT: ${GEMINI_RPM_LIMIT:-100}
+      GEMINI_EMBED_MODEL: ${GEMINI_EMBED_MODEL:-gemini-embedding-001}
+      GEMINI_CHAT_MODEL: ${GEMINI_CHAT_MODEL:-gemini-flash-latest}
+      EMBED_DIM: ${EMBED_DIM:-768}
+      ASK_TOP_K: ${ASK_TOP_K:-8}
+    ports:
+      - "${STREAMLIT_PORT:-8501}:8501"
+    networks:
+      - lakehouse
+    restart: unless-stopped
 
   # =========================================================================
   # Orchestration (Airflow, LocalExecutor)
@@ -283,6 +387,7 @@ services:
 volumes:
   pg-data:
   minio-data:
+  qdrant-data:
   trino-data:
 
 networks:

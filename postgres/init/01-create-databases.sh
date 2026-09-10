@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================================
-# Creates the separate metadata databases + owners used by the lakehouse.
+# Creates the separate metadata databases + owners used by the stack.
 # Runs once, on first initialization of the Postgres data volume.
 # Values are injected from the compose environment (see docker-compose.yml).
 # ============================================================================

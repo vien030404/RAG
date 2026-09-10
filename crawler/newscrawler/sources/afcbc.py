@@ -11,6 +11,7 @@ from bs4 import BeautifulSoup
 from ..article import Article
 from .base import (
     BaseSource,
+    inline_text,
     extract_id,
     join_paragraphs,
     meta,
@@ -22,20 +23,53 @@ from .base import (
 
 class AfcbcSource(BaseSource):
 
-    def __init__(self, name: str, base_url: str, categories: dict[str, str]):
+    def __init__(
+        self,
+        name: str,
+        base_url: str,
+        categories: dict[str, str],
+        timeline_tmpl: str | None = None,
+    ):
         self.name = name
         self.base_url = base_url
         self.categories = categories
+        # URL template cho các trang 2..N (load-more AJAX). Có 2 placeholder:
+        #   {zone} = zoneId của category (lấy từ <input#hdZoneId> trên trang 1)
+        #   {n}    = số trang
+        self.timeline_tmpl = timeline_tmpl
+
+    # Khối danh sách bài chính của trang category (bỏ sidebar "đọc nhiều" /
+    # "tin liên quan" — chúng trộn bài cũ, phá thứ tự mới->cũ mà bộ lọc ngày dựa vào).
+    _STREAM_SEL = '[data-marked-zoneid="tto_cate_stream"], [data-marked-zoneid="tn_cate_stream"]'
 
     def parse_links(self, html: str) -> list[str]:
-        # bài viết: segment cuối có id số dài trước .htm (bỏ trang chuyên mục xxx.htm)
-        return self.links_by_pattern(html, r"-\d{5,}\.htm$")
+        # bài viết: segment cuối có id số dài trước .htm (bỏ trang chuyên mục xxx.htm).
+        # Trang 1 (HTML category đầy đủ): ưu tiên quét trong khối stream để bỏ link
+        # sidebar cũ (thanhnien). Nếu khối rỗng/không có (tuoitre đổ bằng JS, hoặc
+        # fragment timeline trang 2+) -> quét toàn bộ.
+        rx = r"-\d{5,}\.htm$"
+        stream = BeautifulSoup(html, "lxml").select_one(self._STREAM_SEL)
+        if stream is not None:
+            scoped = self.links_by_pattern(str(stream), rx)
+            if scoped:
+                return scoped
+        return self.links_by_pattern(html, rx)
 
     def more_page_urls(self, base_url: str, page1_html: str, max_pages: int) -> list[str]:
-        # tuoitre/thanhnien load-more bằng AJAX (endpoint /timeline/{zoneId}/...),
-        # nhưng zoneId của category KHÔNG trích được ổn định từ HTML tĩnh (nạp qua
-        # JS API) — ép sẽ dễ lấy nhầm category. -> chỉ crawl trang 1 cho an toàn.
-        return []
+        # tuoitre/thanhnien không phân trang bằng URL suffix; "Xem thêm" gọi AJAX
+        # /timeline/{zoneId}/... . zoneId nằm trong <input id="hdZoneId" value="...">
+        # trên chính trang category -> trích được ổn định, khớp đúng category.
+        if not self.timeline_tmpl or max_pages < 2:
+            return []
+        tag = BeautifulSoup(page1_html, "lxml").select_one("#hdZoneId")
+        zone = (tag.get("value") if tag else "") or ""
+        if not zone.isdigit():
+            print(f"[{self.name}] không tìm thấy #hdZoneId ở {base_url} -> chỉ trang 1")
+            return []
+        return [
+            self.timeline_tmpl.format(zone=zone, n=n)
+            for n in range(2, max_pages + 1)
+        ]
 
     def parse_article(self, html: str, url: str) -> Article:
         soup = BeautifulSoup(html, "lxml")
@@ -63,7 +97,7 @@ class AfcbcSource(BaseSource):
         else:
             names: list[str] = []
             for el in soup.select("div.author-info a.name, div.author-item-name a.name"):
-                t = el.get_text(strip=True)
+                t = inline_text(el)
                 if t and t not in names:
                     names.append(t)
             a.author_name = ", ".join(names)
@@ -85,8 +119,9 @@ TuoiTreSource = AfcbcSource(
         "Thể thao": f"{_TT}/the-thao.htm",
         "Giáo dục": f"{_TT}/giao-duc.htm",
         "Sức khỏe": f"{_TT}/suc-khoe.htm",
-        "Công nghệ": f"{_TT}/nhip-song-so.htm",
+        "Nhịp sống số": f"{_TT}/nhip-song-so.htm",   # tên chuyên mục của chính Tuổi Trẻ
     },
+    timeline_tmpl=f"{_TT}/timeline/{{zone}}/trang-{{n}}.htm",
 )
 
 ThanhNienSource = AfcbcSource(
@@ -101,4 +136,5 @@ ThanhNienSource = AfcbcSource(
         "Sức khỏe": f"{_TN}/suc-khoe.htm",
         "Công nghệ": f"{_TN}/cong-nghe.htm",
     },
+    timeline_tmpl=f"{_TN}/timeline/{{zone}}/{{n}}.htm",
 )

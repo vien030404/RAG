@@ -6,8 +6,8 @@ ARG AIRFLOW_VERSION
 # Base image runs Python 3.12; used to select the matching constraints file.
 ARG PYTHON_VERSION=3.12
 
-# Providers the pipeline will use: Trino (query/orchestrate dbt models),
-# Amazon (S3/MinIO), plus clients for Trino and MinIO.
+# Providers the pipeline uses: Amazon (S3/MinIO), Docker (chạy crawler như
+# sibling container), plus MinIO client.
 #
 # IMPORTANT: install against Airflow's official constraints so the resolver
 # never upgrades apache-airflow itself (without this, the latest providers

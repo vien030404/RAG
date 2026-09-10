@@ -147,8 +147,36 @@ def _is_video_card(a) -> bool:
     return False
 
 
+# Khoảng trắng "lạ" hay gặp trong HTML báo: nbsp, zero-width space.
+_WS_RUN = re.compile(r"[ \t ​‌﻿]+")
+# Dấu cách vừa chèn vào SAI CHỖ: trước dấu đóng câu, sau dấu mở.
+_SP_BEFORE = re.compile(r"\s+([,.;:!?%…)\]}»”’])")
+_SP_AFTER = re.compile(r"([(\[{«“‘])\s+")
+
+
+def inline_text(el) -> str:
+    """Text của một thẻ, CÓ dấu cách giữa các thẻ con.
+
+    `get_text(strip=True)` nối text của các con mà không chèn gì, nên
+    `<p>thông tấn<b>TASS</b>của Nga</p>` ra "thông tấnTASScủa Nga" — dính chữ.
+    Đo trên 5.033 bài: 68% số bài có ít nhất một chỗ dính, trung bình 3,5 chỗ.
+    Hậu quả: BM25 tách "tấnTASScủa" thành MỘT token nên tra "TASS" không ra.
+
+    Chèn dấu cách rồi dọn lại, vì chèn thô sẽ đẻ lỗi mới:
+      "Nga<b>,</b> nói"  ->  "Nga , nói"   -> phải thành "Nga, nói"
+      "(<b>Ảnh</b>: X)"  ->  "( Ảnh : X)"  -> phải thành "(Ảnh: X)"
+    """
+    if el is None:
+        return ""
+    t = el.get_text(" ", strip=True)
+    t = _WS_RUN.sub(" ", t)
+    t = _SP_BEFORE.sub(r"\1", t)
+    t = _SP_AFTER.sub(r"\1", t)
+    return t.strip()
+
+
 def txt(el) -> str:
-    return el.get_text(strip=True) if el is not None else ""
+    return inline_text(el)
 
 
 def meta(soup: BeautifulSoup, *, name: str | None = None, prop: str | None = None) -> str:
@@ -204,7 +232,7 @@ def join_paragraphs(container) -> tuple[str, int]:
             continue
         if p.find_parent(["figure", "figcaption"]):   # caption ảnh -> bỏ
             continue
-        t = p.get_text(strip=True)
+        t = inline_text(p)          # chèn dấu cách giữa <b>/<i>/<a> rồi dọn
         if t:
             parts.append(t)
     content = "\n\n".join(parts)
@@ -310,3 +338,60 @@ def tightest_body(soup: BeautifulSoup):
         if tl > best_len:
             best, best_len = el, tl
     return best
+
+
+# Bút danh tòa soạn / hãng tin / nhãn nội dung tài trợ — KHÔNG phải tên tác giả.
+# Đo trên dữ liệu thật: tuoitre ghi "TTXVN", dantri ghi "PV"/"Dân trí",
+# thanhnien ghi "Thông tin dịch vụ"/"Nguồn: Bệnh viện FV".
+_NOT_A_PERSON = {
+    "ttxvn", "vna", "pv", "ctv", "nhóm pv", "nhóm phóng viên", "phóng viên",
+    "dân trí", "tuổi trẻ", "thanh niên", "vnexpress", "vietnamnet",
+    "thông tin dịch vụ", "tin tài trợ", "quảng cáo",
+}
+
+
+_SRC_SPLIT_RE = re.compile(r"\s*[,/]\s*")
+
+
+def split_sources(raw) -> list[str]:
+    """"AFP, Reuters" -> ["AFP", "Reuters"] · "Health 2.0/TVBS" -> [...].
+
+    Vì sao phải tách: đo trên dữ liệu thật, 404/605 giá trị chứa nhiều hãng
+    trong MỘT chuỗi (tối đa 5), sinh ra hàng trăm chuỗi khác nhau cho vài chục
+    hãng có thật. Lọc `source_attribution = 'Reuters'` vì thế trượt hết những
+    bài ghi "AFP, Reuters". Thành mảng thì khớp theo PHẦN TỬ, giống `tags`.
+
+    Chỉ tách `,` và `/` — dữ liệu thật không dùng dấu phân cách nào khác, và
+    tách rộng hơn sẽ vỡ những tên vốn có dấu ("L'Équipe", "Health 2.0").
+    """
+    if not raw:
+        return []
+    if isinstance(raw, (list, tuple)):
+        raw = ", ".join(str(x) for x in raw)
+    out: list[str] = []
+    seen: set[str] = set()
+    for part in _SRC_SPLIT_RE.split(str(raw).strip()):
+        p = part.strip(" .;-")
+        key = p.lower()
+        if p and key not in seen:      # "Reuters, AFP, Reuters" -> 2 phần tử
+            seen.add(key)
+            out.append(p)
+    return out
+
+
+def demote_agency_author(a: Article) -> None:
+    """Chuyển hãng tin / bút danh tòa soạn từ `author_name` sang `source_attribution`.
+
+    Hai cột này mang ngữ nghĩa khác nhau: `author_name` để lọc "bài của nhà báo X",
+    `source_attribution` để biết bài dẫn lại từ đâu. Trộn lẫn thì cả hai bộ lọc
+    đều sai. Gọi sau parse_article, áp cho mọi nguồn.
+    """
+    name = (a.author_name or "").strip()
+    if not name:
+        return
+    low = name.lower()
+    if low in _NOT_A_PERSON or low.startswith("nguồn:"):
+        a.author_name = ""
+        src = name[6:].strip() if low.startswith("nguồn:") else name
+        if src and not a.source_attribution:
+            a.source_attribution = split_sources(src)

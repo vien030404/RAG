@@ -17,6 +17,7 @@ from pyiceberg.exceptions import (
     NoSuchTableError,
     TableAlreadyExistsError,
 )
+from pyiceberg.expressions import EqualTo
 
 from .article import Article
 
@@ -42,11 +43,15 @@ SCHEMA = pa.schema([
     ("word_count", pa.int64()),
     ("thumbnail_url", pa.string()),
     ("author_name", pa.string()),
-    ("source_attribution", pa.string()),
+    # mảng như `tags`: 1 bài hay dẫn nhiều hãng ("AFP, Reuters") -> lọc theo phần tử
+    ("source_attribution", pa.list_(pa.string())),
     ("published_at", pa.timestamp("us", tz="UTC")),
     ("crawled_at", pa.timestamp("us", tz="UTC")),
     ("source", pa.string()),
     ("crawl_status", pa.string()),
+    # --- cột dẫn xuất, tính luôn lúc ghi ---
+    ("published_date", pa.date32()),
+    ("content_len", pa.int64()),
 ])
 
 _catalog = None
@@ -96,6 +101,7 @@ def _utc(dt: datetime | None) -> datetime | None:
 
 
 def _to_row(a: Article) -> dict:
+    pub = _utc(a.published_at)
     return {
         "url_hash": a.url_hash,
         "url": a.url,
@@ -110,12 +116,41 @@ def _to_row(a: Article) -> dict:
         "word_count": a.word_count,
         "thumbnail_url": a.thumbnail_url,
         "author_name": a.author_name,
-        "source_attribution": a.source_attribution,
-        "published_at": _utc(a.published_at),
+        "source_attribution": a.source_attribution or [],
+        "published_at": pub,
         "crawled_at": _utc(a.crawled_at),
         "source": a.source,
         "crawl_status": a.crawl_status,
+        "published_date": pub.date() if pub else None,
+        "content_len": len(a.content or ""),
     }
+
+
+def known_published_dates(source_name: str) -> dict[str, str]:
+    """`url_hash` -> ngày xuất bản của các bài ĐÃ có trong Bronze cho 1 nguồn.
+
+    Dùng để bỏ qua bài đã cào khi DAG chạy lại cùng một ngày (run bị dồn, retry,
+    trigger tay). Trước đây trạng thái chống trùng chỉ nằm trong RAM của tiến
+    trình nên container mới không biết gì -> cào lại từ đầu.
+
+    Trả kèm NGÀY (không chỉ tập url_hash) để logic dừng phân trang vẫn tính được
+    `newest_on_page` cho những link bị bỏ qua — nếu không sẽ dừng sai.
+
+    Lọc theo `source` nên 4 task nguồn chạy song song không giẫm chân nhau.
+    """
+    try:
+        table = _catalog_conn().load_table(TABLE_IDENT)
+    except NoSuchTableError:
+        return {}                     # lần chạy đầu, chưa có bảng
+    tb = table.scan(
+        row_filter=EqualTo("source", source_name),
+        selected_fields=("url_hash", "published_at"),
+    ).to_arrow()
+    if tb.num_rows == 0:
+        return {}
+    hashes = tb.column("url_hash").to_pylist()
+    pubs = tb.column("published_at").to_pylist()
+    return {h: p.date() for h, p in zip(hashes, pubs) if h and p is not None}
 
 
 def save_articles(

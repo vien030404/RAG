@@ -5,3 +5,8 @@ lxml==5.3.0
 pyiceberg[pyarrow]==0.8.1
 boto3==1.35.36
 python-dotenv==1.0.1
+# RAG: embedding (Gemini) + vector store (Qdrant)
+google-genai==1.2.0
+qdrant-client==1.12.1
+# Giao dien hoi-dap (docker compose --profile chat up chatbot)
+streamlit==1.39.0

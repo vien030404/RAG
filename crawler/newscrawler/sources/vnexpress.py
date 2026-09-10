@@ -13,6 +13,7 @@ from .base import (
     meta,
     parse_iso,
     split_keywords,
+    split_sources,
     txt,
 )
 
@@ -28,6 +29,26 @@ def _is_ad(tag) -> bool:
         if "item-ads" in (node.get("class", []) or []):
             return True
     return False
+
+
+# Chức danh đứng trước tên trong byline bài tư vấn ("Bác sĩ CKI Lê Ngọc Vinh").
+_TITLE_PREFIX_RE = re.compile(
+    r"^(?:(?:ths|thạc sĩ|ts|tiến sĩ|bs|bác sĩ|pgs|gs|cki|ckii|dược sĩ|ds)[.,\s]+)+",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_name(text: str) -> bool:
+    """Byline VnExpress là tên người: 2-6 từ, mọi từ viết hoa đầu.
+
+    Loại được tiêu đề phụ ("Hay quên, khó tập trung kéo dài", "Việt quất",
+    "Đeo kính bảo vệ khi ra ngoài") vốn có từ viết thường.
+    """
+    core = _TITLE_PREFIX_RE.sub("", text).strip()
+    words = core.split()
+    if not 2 <= len(words) <= 6:
+        return False
+    return all(w[:1].isupper() for w in words)
 
 
 class VnExpressSource(BaseSource):
@@ -51,7 +72,10 @@ class VnExpressSource(BaseSource):
         soup = BeautifulSoup(html, "lxml")
         seen: set[str] = set()
         links: list[str] = []
-        for tag in soup.select("h3.title-news a, h2.title-news a"):
+        # Không khóa cứng vào h3: chuyên mục Khoa học công nghệ dùng h4.title-news
+        # (đo được 44 link h4 + 7 link h3, trong khi Thời sự chỉ có h3 × 50).
+        # Bám vào class .title-news thay vì thẻ heading để phủ mọi biến thể layout.
+        for tag in soup.select(".title-news a"):
             href = tag.get("href", "")
             if href.startswith(_BASE) and href not in seen and not _is_ad(tag):
                 seen.add(href)
@@ -79,29 +103,39 @@ class VnExpressSource(BaseSource):
 
         a.thumbnail_url = meta(soup, prop="og:image")
 
+        # Byline chuẩn (hiếm gặp trên bài thường).
         author_tag = soup.select_one("p.author_mail strong")
-        if not author_tag:
-            for tag in reversed(soup.select("p.Normal strong")):
-                text = tag.get_text(strip=True)
-                if not text or len(text) > 50 or "\n" in text:
+        byline_tag = None
+        if not author_tag and body is not None:
+            # Dạng thực tế của VnExpress: đoạn CUỐI bài, CĂN PHẢI, dạng
+            #   <p class="Normal" style="text-align:right"><strong>Tên</strong> (Theo X)</p>
+            # Bám vào text-align:right thay vì "thẻ <strong> cuối cùng" — heuristic
+            # cũ vớ phải tiêu đề phụ của bài dạng danh sách ("Việt quất", "Hay quên,
+            # khó tập trung kéo dài") vốn cũng là <strong> nhưng căn trái.
+            for tag in reversed(body.find_all("p")):
+                style = (tag.get("style") or "").replace(" ", "").lower()
+                if "text-align:right" not in style:
                     continue
-                if tag.find_parent("a") is not None:
-                    continue
-                if text.startswith(">>") or "?" in text:
-                    continue
-                if any(q in text for q in ('"', "“", "”")):
-                    continue
-                if " " not in text:
-                    continue
-                author_tag = tag
-                break
-        if author_tag:
-            a.author_name = author_tag.get_text(strip=True)
-            byline = author_tag.find_parent("p")
-            if byline:
-                m = re.search(r"\(\s*Theo\s+(.*?)\s*\)", byline.get_text(" ", strip=True), re.IGNORECASE)
-                if m:
-                    a.source_attribution = m.group(1).strip()
+                strong = tag.find("strong")
+                if strong is not None and strong.find_parent("a") is None \
+                        and _looks_like_name(txt(strong)):
+                    author_tag = strong
+                    break
+                # Không có <strong> hợp lệ -> lấy phần TRƯỚC dấu "(" của đoạn byline.
+                # Dạng gặp thật: "Bảo Bảo (Tổng hợp) Ảnh: Bảo Bảo, Anh Chi" — phần
+                # sau là credit ảnh, không phải tác giả.
+                lead = re.split(r"[(\[]|Ảnh\s*:", tag.get_text(" ", strip=True))[0].strip()
+                if _looks_like_name(lead):
+                    a.author_name = lead
+                    byline_tag = tag
+                    break
+        if author_tag is not None:
+            a.author_name = txt(author_tag)
+        byline = byline_tag or (author_tag.find_parent("p") if author_tag is not None else None)
+        if byline is not None:
+            m = re.search(r"\(\s*Theo\s+(.*?)\s*\)", byline.get_text(" ", strip=True), re.IGNORECASE)
+            if m:
+                a.source_attribution = split_sources(m.group(1))
 
         pub = meta(soup, name="pubdate", prop="article:published_time")
         a.published_at = parse_iso(pub)

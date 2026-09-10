@@ -19,7 +19,10 @@ REQUEST_TIMEOUT = 15   # giây
 MAX_RETRIES = 3
 
 # Phạm vi crawl
-MAX_PAGES = 10   # số trang listing / category (0 hoặc None = không cào; >=1)
+MAX_PAGES = 20   # TRẦN số trang listing / category. crawl_category tự dừng sớm
+                 # khi 1 trang không còn bài nào của target_date (xét ngày MAX
+                 # trên trang) — trần cao chỉ để phủ hết ngày tin nhiều.
+                 # (0 hoặc None = không cào; >=1)
 # Không giới hạn số bài mỗi category (lấy hết bài trên mỗi trang listing).
 
 # Bỏ bài không có nội dung text (video / trang không phải bài viết).

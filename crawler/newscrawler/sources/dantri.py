@@ -20,6 +20,7 @@ from .base import (
     meta,
     parse_vn_datetime,
     split_keywords,
+    split_sources,
     theo_source,
     tightest_body,
     txt,
@@ -87,6 +88,6 @@ class DanTriSource(BaseSource):
         a.author_name = author_from_jsonld(soup) or txt(soup.select_one("a[href*='/tac-gia/']"))
 
         # source_attribution: bài dịch/quốc tế kết bằng "Theo <Nguồn>" (hiếm)
-        a.source_attribution = theo_source(soup)
+        a.source_attribution = split_sources(theo_source(soup))
 
         return a

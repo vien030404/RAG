@@ -29,7 +29,9 @@ class Article:
 
     # Author
     author_name: str = ""
-    source_attribution: str = ""
+    # Mảng, KHÔNG phải chuỗi: 1 bài thường dẫn nhiều hãng ("AFP, Reuters").
+    # Gán qua `sources.base.split_sources` để tách sẵn thành phần.
+    source_attribution: list[str] = field(default_factory=list)
 
     # Time
     published_at: datetime | None = None

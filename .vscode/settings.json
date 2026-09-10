@@ -1,18 +1,41 @@
 {
+    // SQLTools: mỗi database Postgres phải là MỘT kết nối riêng — PostgreSQL
+    // không cho truy vấn xuyên database trong cùng một phiên.
+    // Mật khẩu KHÔNG đặt ở đây (thư mục .vscode không nằm trong .gitignore):
+    // dùng askForPassword, giá trị lấy từ POSTGRES_PASSWORD trong .env.
     "sqltools.connections": [
         {
-            "trinoOptions": {
-                "ssl": {
-                    "rejectUnauthorized": true
-                }
-            },
+            "name": "airflow (48 bảng)",
+            "driver": "PostgreSQL",
+            "server": "localhost",
+            "port": 5432,
+            "database": "airflow",
+            "username": "postgres",
+            "askForPassword": true,
             "previewLimit": 50,
-            "driver": "Trino Driver",
-            "name": "lakehouse-trino",
-            "server": "http://localhost:8080",
-            "catalog": "iceberg",
-            "schema": "bronze",
-            "user": "trino"
+            "ssh": "Disabled"
+        },
+        {
+            "name": "iceberg_catalog (2 bảng)",
+            "driver": "PostgreSQL",
+            "server": "localhost",
+            "port": 5432,
+            "database": "iceberg_catalog",
+            "username": "postgres",
+            "askForPassword": true,
+            "previewLimit": 50,
+            "ssh": "Disabled"
+        },
+        {
+            "name": "postgres (rỗng — chỉ để quản trị)",
+            "driver": "PostgreSQL",
+            "server": "localhost",
+            "port": 5432,
+            "database": "postgres",
+            "username": "postgres",
+            "askForPassword": true,
+            "previewLimit": 50,
+            "ssh": "Disabled"
         }
     ]
 }

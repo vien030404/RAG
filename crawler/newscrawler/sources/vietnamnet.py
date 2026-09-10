@@ -57,10 +57,13 @@ class VietnamNetSource(BaseSource):
         a.tags = split_keywords(meta(soup, name="keywords"))
         self.fill_hierarchy(soup, a)
 
-        a.author_name = txt(
-            soup.select_one("div.article-detail-author__main")
-            or soup.select_one("p.article-detail-author__info")
-        )
+        # Khối tác giả gồm <span class="name"> + <span class="position"> ("Nhà báo",
+        # "Thầy giáo ở Hương Sơn, Hà Tĩnh"...). Lấy text cả khối sẽ dính liền thành
+        # "Đàm ĐệNhà báo" -> chỉ lấy span.name; chức danh không phải tên tác giả.
+        block = (soup.select_one("div.article-detail-author__main")
+                 or soup.select_one("p.article-detail-author__info"))
+        if block is not None:
+            a.author_name = txt(block.select_one("span.name")) or block.get_text(" ", strip=True)
 
         pub = soup.select_one("div.publish-date") or soup.select_one("div.bread-crumb-detail__time")
         a.published_at = parse_vn_datetime(txt(pub))

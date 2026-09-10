@@ -44,3 +44,16 @@ def save_raw_html(source: str, url_hash: str, html: str, when: datetime | None =
         ContentEncoding="gzip",
     )
     return key
+
+
+def load_raw_html(source: str, url_hash: str, when: datetime) -> str | None:
+    """Đọc lại HTML thô đã lưu. `when` là ngày CRAWL (crawled_at), không phải ngày đăng.
+
+    Trả None nếu không có object — bài cào trước khi bật lưu raw, hoặc lệch ngày.
+    """
+    key = f"source={source}/dt={when:%Y-%m-%d}/{url_hash}.html.gz"
+    try:
+        obj = _client().get_object(Bucket=RAW_BUCKET, Key=key)
+    except Exception:
+        return None
+    return gzip.decompress(obj["Body"].read()).decode("utf-8", errors="replace")
