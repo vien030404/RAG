@@ -3,8 +3,15 @@
     python -m newscrawler.ask "Giá vàng hôm qua thế nào?"
     python -m newscrawler.ask --source vnexpress --days 3 "Tin thể thao nổi bật?"
 
-Chống bịa: chỉ trả lời dựa trên đoạn trích lấy được; không đủ căn cứ thì nói
-không tìm thấy, không suy đoán.
+Câu trả lời chỉ được dựng từ các đoạn trích truy hồi được. Ba cổng kiểm soát
+chặn mô hình nói những điều kho không có, và quan trọng là cả ba đều cắt bằng
+code chứ không chỉ bằng lời nhắc trong prompt:
+
+    cổng 1   sàn cosine thực — kho không có gì đủ gần thì không gọi LLM
+    cổng 2   chuỗi từ chối cố định — mô hình tự khai khi thiếu căn cứ
+    cổng 3   bắt buộc trích dẫn — câu không dẫn được nguồn thì bị bỏ
+
+Chi tiết từng cổng ở phần hằng số và ở `ask()` bên dưới.
 """
 from __future__ import annotations
 
@@ -23,46 +30,55 @@ from . import bm25, vectorstore as vs
 from .embed import embed_texts
 from .gemini import KeyPool, is_quota_error
 
-# Dùng ALIAS "-latest" chứ không ghim số phiên bản: 2026-09-07 Google gỡ
-# `gemini-2.5-flash` với tài khoản mới (404 "no longer available to new users")
-# và cả pipeline hỏi-đáp chết câm. Alias tự trỏ sang bản flash hiện hành.
+# Dùng alias "-latest" thay vì ghim số phiên bản. Google có thể ngừng cấp một
+# phiên bản cụ thể cho tài khoản mới trong khi `models.list()` vẫn liệt kê nó —
+# khi đó mọi lệnh gọi trả 404 và cả đường hỏi-đáp ngừng hoạt động. Alias luôn
+# trỏ sang bản flash hiện hành.
 CHAT_MODEL = os.getenv("GEMINI_CHAT_MODEL", "gemini-flash-latest")
 TOP_K = int(os.getenv("ASK_TOP_K", "8"))
 TZ_VN = timezone(timedelta(hours=7))
 _MAX_TRY = 4
-# Lấy dư bao nhiêu lần ở tầng chunk trước khi gộp về bài. Bài dài chiếm nhiều
-# chunk nên không lấy dư sẽ hụt số bài trả về.
+# Hệ số lấy dư ở tầng chunk trước khi gộp về bài. Một bài dài chiếm nhiều chunk,
+# nên lấy đúng `top_k` chunk sẽ gộp lại ra ít bài hơn yêu cầu.
 OVERFETCH = int(os.getenv("ASK_OVERFETCH", "3"))
 
 # --- Cách sắp xếp bài sau khi truy hồi ------------------------------------
-SORT_RELEVANCE = "relevance"   # độ khớp trước, NGANG ĐIỂM thì bài mới trước (mặc định)
-SORT_RECENT = "recent"         # thuần mới nhất
+SORT_RELEVANCE = "relevance"   # độ khớp trước, ngang điểm thì bài mới trước
+SORT_RECENT = "recent"         # thuần theo thời gian
 SORTS = (SORT_RELEVANCE, SORT_RECENT)
 
-# Hai điểm chênh nhau dưới ngưỡng này coi như NGANG NHAU -> để ngày quyết định.
-# Thời gian chỉ phá thế hoà, KHÔNG bao giờ hạ điểm một bài đang khớp tốt hơn.
+# Hai bài chênh điểm dưới ngưỡng này được coi là ngang nhau, và khi đó thời gian
+# quyết định thứ tự. Thời gian chỉ phá thế hoà: nó không bao giờ đẩy một bài
+# khớp tốt hơn xuống dưới một bài khớp kém hơn.
 SCORE_EPS = float(os.getenv("ASK_SCORE_EPS", "0.02"))
-# Sắp theo "mới nhất" cần lấy dư nhiều hơn: bài mới nhất của kho chưa chắc lọt
-# vào nhóm khớp cao nhất, không lấy rộng thì "mới nhất" chỉ mới trong phạm vi hẹp.
+# Chế độ sắp theo thời gian cần lấy dư rộng hơn: bài mới nhất của kho không chắc
+# nằm trong nhóm khớp cao nhất, lấy hẹp thì "mới nhất" chỉ mới trong phạm vi hẹp
+# đó chứ không mới trên toàn kho.
 RECENT_OVERFETCH = int(os.getenv("ASK_RECENT_OVERFETCH", "8"))
 
-# --- Gác cổng chống bịa ----------------------------------------------------
-# Sàn COSINE THẬT (không phải điểm RRF) để coi là "kho có dữ liệu về việc này".
-# Đo trên chính kho này:
-#     "giá vàng hôm nay tăng hay giảm"          -> 0.771  (có dữ liệu)
-#     "công thức làm bánh chưng nhân sầu riêng" -> 0.627  (không có)
-#     "cách nuôi cá koi trong bể xi măng"       -> 0.617  (không có)
-# Vector luôn trả về thứ "gần nhất", nên không có sàn thì câu hỏi vô nghĩa vẫn
-# ra 8 bài và LLM vẫn có cái để bịa. Hiệu chuẩn trên ít mẫu -> chỉnh được qua env.
+# --- Ba cổng chống bịa -----------------------------------------------------
+# Cổng 1: sàn cosine thực, không phải điểm RRF. Tìm kiếm vector luôn trả về thứ
+# gần nhất nó có, nên nếu không đặt sàn thì một câu hỏi hoàn toàn ngoài phạm vi
+# kho vẫn nhận đủ 8 bài và mô hình vẫn có nguyên liệu để suy diễn.
+#
+# Hiệu chuẩn trên chính corpus này:
+#     "giá vàng hôm nay tăng hay giảm"          -> 0.771   (kho có)
+#     "công thức làm bánh chưng nhân sầu riêng" -> 0.627   (kho không có)
+#     "cách nuôi cá koi trong bể xi măng"       -> 0.617   (kho không có)
+#
+# Khoảng trống giữa hai nhóm khá rộng, nhưng số mẫu hiệu chuẩn còn ít nên ngưỡng
+# để cấu hình được qua biến môi trường.
 MIN_COSINE = float(os.getenv("ASK_MIN_COSINE", "0.70"))
-# Đường tương tác: chờ quota tối đa ngần này giây rồi báo lỗi, không treo.
+# Giới hạn chờ hạn mức trên đường tương tác: hết thời gian thì báo lỗi rõ ràng
+# thay vì để giao diện treo.
 MAX_WAIT = float(os.getenv("ASK_MAX_WAIT", "20"))
-# Chấp nhận cả "[1][2]" lẫn "[1, 2, 3]" — model dùng cả hai kiểu, và bắt cứng
-# một kiểu sẽ vứt oan câu ĐANG trích dẫn đúng.
+# Cổng 3 nhận cả dạng "[1][2]" và dạng "[1, 2, 3]". Mô hình dùng xen kẽ hai
+# dạng, nên nếu chỉ bắt một dạng thì những câu trích dẫn hợp lệ ở dạng còn lại
+# sẽ bị loại oan.
 _CITE_RE = re.compile(r"\[\s*(\d+(?:\s*[,;]\s*\d+)*)\s*\]")
 
-# Câu "từ chối" phải là một chuỗi CỐ ĐỊNH, không phải câu tự do — để tầng trên
-# nhận ra bằng so khớp chuỗi và ẩn hẳn khối trả lời đi, chỉ hiện danh sách bài.
+# Cổng 2 dựa trên một chuỗi từ chối cố định thay vì câu tự do, để tầng trên nhận
+# ra bằng so khớp chuỗi rồi ẩn hẳn khối trả lời và chỉ hiện danh sách bài.
 NO_DATA = "KHÔNG ĐỦ DỮ LIỆU"
 
 SYSTEM = f"""Bạn là bộ tóm tắt tin tức tiếng Việt. Bạn KHÔNG phải trợ lý trò chuyện.
@@ -90,13 +106,15 @@ def search(query: str, top_k: int = TOP_K, source: str | None = None,
     gclient = KeyPool(max_wait=MAX_WAIT)
     qc = vs.client()
 
-    # task_type khác lúc index (RETRIEVAL_QUERY vs RETRIEVAL_DOCUMENT) — Gemini
-    # tối ưu riêng cho từng vai, dùng sai làm giảm rõ chất lượng truy hồi.
+    # `task_type` ở đây là RETRIEVAL_QUERY, khác RETRIEVAL_DOCUMENT dùng lúc
+    # index. Gemini tối ưu riêng cho từng vai, nên đặt sai làm giảm rõ chất
+    # lượng truy hồi dù vector vẫn cùng số chiều.
     qvec = embed_texts(gclient, [query], "RETRIEVAL_QUERY")[0]
     sidx, sval = bm25.query_vector(query)
 
-    # Trường định danh -> so khớp CHÍNH XÁC ở payload, không dựa vào lexical match
-    # trong text (tránh nhầm tác giả với người được nhắc trong bài).
+    # Các trường định danh được lọc bằng so khớp chính xác trên payload chứ không
+    # dựa vào khớp mặt chữ trong text, để không nhầm tác giả của bài với người
+    # cùng tên được nhắc trong nội dung.
     must = []
     if source:
         must.append(qm.FieldCondition(key="source", match=qm.MatchValue(value=source)))
@@ -105,26 +123,28 @@ def search(query: str, top_k: int = TOP_K, source: str | None = None,
     if author:
         must.append(qm.FieldCondition(key="author_name", match=qm.MatchValue(value=author)))
     if tag:
-        # `tags` là mảng -> MatchValue khớp nếu BẤT KỲ phần tử nào bằng giá trị
+        # `tags` là mảng; MatchValue khớp khi bất kỳ phần tử nào bằng giá trị.
         must.append(qm.FieldCondition(key="tags", match=qm.MatchValue(value=tag)))
     if attribution:
-        # cũng là mảng: "AFP, Reuters" đã tách nên lọc 'Reuters' bắt được cả bài đó
+        # Cũng là mảng. Nhờ đã tách sẵn từ "AFP, Reuters" thành hai phần tử, lọc
+        # theo "Reuters" bắt được cả những bài dẫn nhiều hãng cùng lúc.
         must.append(qm.FieldCondition(key="source_attribution",
                                       match=qm.MatchValue(value=attribution)))
     if days:
         since = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
         must.append(qm.FieldCondition(key="published_ts", range=qm.Range(gte=since)))
 
-    # Hybrid: dense (ngữ nghĩa) + BM25 (khớp chính xác tên riêng/số liệu), hợp
-    # nhất bằng RRF trên server.
+    # Truy hồi hybrid: nhánh dense bắt ngữ nghĩa, nhánh BM25 bắt khớp đúng mặt
+    # chữ với tên riêng và số liệu; hai bảng xếp hạng hợp nhất bằng RRF trên
+    # server.
     points = vs.hybrid_search(
         qc, qvec, sidx, sval, limit=top_k,
         query_filter=qm.Filter(must=must) if must else None,
         with_vectors=True,
     )
-    # Cosine thật = tích vô hướng, vì cả hai vector đều đã chuẩn hoá L2.
-    # Gắn vào payload để tầng trên dùng làm ngưỡng; điểm RRF không làm được
-    # việc này (nó chỉ nói "hạng mấy", không nói "có giống không").
+    # Cả hai vector đều đã chuẩn hoá L2 nên cosine bằng đúng tích vô hướng.
+    # Giá trị này được gắn vào payload để cổng 1 dùng làm ngưỡng; điểm RRF không
+    # thay thế được vì nó chỉ cho biết thứ hạng, không cho biết mức tương đồng.
     for p in points:
         vec = (p.vector or {}).get(vs.DENSE) if isinstance(p.vector, dict) else None
         if vec is not None and p.payload is not None:
@@ -133,14 +153,15 @@ def search(query: str, top_k: int = TOP_K, source: str | None = None,
 
 
 def group_articles(points: list, limit: int, sort: str = SORT_RELEVANCE) -> list[dict]:
-    """Gộp chunk về BÀI BÁO — đơn vị người dùng quan tâm.
+    """Gộp chunk về bài báo, tức đơn vị mà người đọc thực sự quan tâm.
 
-    Trước đây việc gộp diễn ra SAU khi đã cắt top-k, nên một bài dài 4 chunk có
-    thể chiếm 4/8 chỗ rồi hiện ra như một nguồn duy nhất: người dùng xin 8 bài
-    mà chỉ nhận được 5. Nay lấy dư ở tầng chunk rồi mới cắt ở tầng bài.
+    Thứ tự giữa hai bước là quan trọng: truy hồi lấy dư ở tầng chunk, rồi cắt
+    `limit` ở tầng bài. Nếu cắt top-k ngay ở tầng chunk thì một bài dài bốn
+    chunk có thể giữ bốn trong tám chỗ nhưng hiển thị thành một nguồn duy nhất,
+    khiến yêu cầu tám bài chỉ trả về năm.
 
-    Điểm của bài = điểm của chunk khớp mạnh nhất (không cộng dồn — cộng dồn sẽ
-    thiên vị bài dài chỉ vì nó có nhiều chunk).
+    Điểm của một bài lấy theo chunk khớp mạnh nhất, không cộng dồn các chunk:
+    cộng dồn sẽ thiên vị bài dài chỉ vì nó được cắt thành nhiều phần hơn.
     """
     by: dict = {}
     for p in points:
@@ -157,9 +178,10 @@ def group_articles(points: list, limit: int, sort: str = SORT_RELEVANCE) -> list
 
     for a in by.values():
         a["ts"] = a["payload"].get("published_ts") or 0
-        # Gom điểm thành bậc: chênh dưới SCORE_EPS là "ngang nhau". RRF vốn hay
-        # ra điểm trùng khít (0.5333 lặp lại), và khi đó thứ tự trước đây phụ
-        # thuộc thứ tự dict — tuỳ tiện. Nay ngang bậc thì bài mới đứng trước.
+        # Lượng tử điểm thành bậc, mỗi bậc rộng SCORE_EPS. RRF thường cho ra
+        # những điểm trùng khít nhau, và khi điểm bằng nhau thì thứ tự chỉ còn
+        # phụ thuộc thứ tự chèn vào dict — tức tuỳ tiện. Chia bậc biến thế hoà
+        # đó thành một quy tắc tường minh: cùng bậc thì bài mới đứng trước.
         a["tier"] = round(a["score"] / SCORE_EPS)
 
     if sort == SORT_RECENT:
@@ -191,7 +213,11 @@ def group_articles(points: list, limit: int, sort: str = SORT_RELEVANCE) -> list
 
 
 def _prompt_blocks(articles: list[dict]) -> str:
-    """Đoạn trích đưa cho LLM. Số [n] khớp đúng với thứ tự thẻ bài hiển thị."""
+    """Dựng khối đoạn trích cho LLM.
+
+    Số [n] trùng khớp với thứ tự thẻ bài trên giao diện, nhờ đó trích dẫn trong
+    câu trả lời chỉ đúng vào bài người đọc đang nhìn thấy.
+    """
     return "\n\n---\n\n".join(
         f"[{a['n']}] {a['title']}\n"
         f"Nguồn: {a['source']} | Ngày: {a['date']} | Chuyên mục: {a['category']}\n"
@@ -201,13 +227,17 @@ def _prompt_blocks(articles: list[dict]) -> str:
 
 
 def _generate(pool: KeyPool, prompt: str) -> str:
-    """Sinh câu trả lời. Hai chế độ hỏng, xử lý khác nhau:
+    """Sinh câu trả lời từ prompt đã dựng.
 
-      * 429 -> key đó cạn hạn ngạch, cho nghỉ rồi `acquire()` lấy key khác
-      * 503 -> model quá tải nhất thời (đo được với `gemini-flash-latest`),
-               chờ lũy tiến rồi thử lại; KHÔNG đổi key vì key không có lỗi
+    Nhận vào `KeyPool` chứ không nhận client: client phải lấy qua `acquire()` ở
+    từng lần thử, vì key được chọn có thể đổi giữa các lần.
 
-    `KeyPool` là BỂ key, không phải client — phải `acquire()` mới có client.
+    Hai dạng lỗi xử lý khác nhau:
+
+      * 429 — key đó cạn hạn mức; cho nghỉ rồi `acquire()` lấy key khác.
+      * 503 hoặc UNAVAILABLE — model quá tải nhất thời, quan sát được với
+        `gemini-flash-latest`. Chờ luỹ tiến rồi thử lại trên cùng key, vì lỗi
+        không nằm ở key.
     """
     cfg = types.GenerateContentConfig(system_instruction=SYSTEM, temperature=0.2)
     last: Exception | None = None
@@ -229,11 +259,11 @@ def _generate(pool: KeyPool, prompt: str) -> str:
 
 def search_articles(query: str, top_k: int = TOP_K,
                     sort: str = SORT_RELEVANCE, **kw) -> list[dict]:
-    """Truy hồi rồi trả về DANH SÁCH BÀI (đã khử trùng), không phải chunk.
+    """Truy hồi rồi trả về danh sách bài đã khử trùng, không phải danh sách chunk.
 
-    Lấy dư ở tầng chunk để sau khi gộp vẫn còn đủ `top_k` bài KHÁC NHAU. Chế độ
-    "mới nhất" lấy dư rộng hơn hẳn, vì bài mới nhất của kho không nhất thiết nằm
-    trong nhóm khớp cao nhất.
+    Lấy dư ở tầng chunk để sau khi gộp vẫn còn đủ `top_k` bài khác nhau. Chế độ
+    sắp theo thời gian lấy dư rộng hơn đáng kể, vì bài mới nhất của kho không
+    nhất thiết nằm trong nhóm khớp cao nhất.
     """
     mult = RECENT_OVERFETCH if sort == SORT_RECENT else OVERFETCH
     points = search(query, top_k=top_k * mult, **kw)
@@ -241,11 +271,12 @@ def search_articles(query: str, top_k: int = TOP_K,
 
 
 def _enforce_citations(answer: str, n_articles: int) -> str | None:
-    """CỔNG 2 — chỉ giữ lại câu có trích dẫn [n] HỢP LỆ.
+    """Cổng 3 — chỉ giữ những câu có trích dẫn [n] hợp lệ.
 
-    Prompt chỉ là lời dặn; model vẫn có thể viết câu không nguồn hoặc trích [9]
-    khi chỉ có 5 bài. Ở đây cắt bằng code: dòng nào không gắn được [n] trong
-    khoảng 1..n_articles thì bỏ. Không còn dòng nào -> không có câu trả lời.
+    Prompt chỉ là lời dặn, mô hình vẫn có thể viết câu không dẫn nguồn hoặc dẫn
+    [9] khi danh sách chỉ có 5 bài. Việc cắt vì vậy làm bằng code: dòng nào
+    không mang được [n] trong khoảng 1..n_articles thì bỏ. Không còn dòng nào
+    nghĩa là không có câu trả lời nào đứng vững.
     """
     keep = []
     for line in answer.splitlines():
@@ -262,11 +293,12 @@ def ask(query: str, top_k: int = TOP_K, generate: bool = True,
         sort: str = SORT_RELEVANCE, **kw) -> dict:
     """Trả về {"articles", "answer", "grounded", "best_cos"}.
 
-    `articles` LUÔN là phần chính — có gì trong kho thì hiện nấy.
-    `answer` chỉ tồn tại khi qua được CẢ BA cổng:
-        1. cosine thật của bài tốt nhất >= MIN_COSINE  (kho thực sự có dữ liệu)
-        2. model không tự khai KHÔNG ĐỦ DỮ LIỆU
-        3. còn ít nhất một câu có trích dẫn [n] hợp lệ
+    `articles` luôn là phần chính của kết quả: kho có gì thì trả về đúng thứ đó.
+    `answer` là phần phụ và chỉ tồn tại khi qua được cả ba cổng:
+
+        1. cosine thực của bài tốt nhất đạt MIN_COSINE — kho thực sự có dữ liệu
+        2. mô hình không tự khai thiếu căn cứ
+        3. còn lại ít nhất một câu mang trích dẫn [n] hợp lệ
     """
     articles = search_articles(query, top_k=top_k, sort=sort, **kw)
     best_cos = max((a["cos"] for a in articles), default=0.0)
@@ -274,7 +306,8 @@ def ask(query: str, top_k: int = TOP_K, generate: bool = True,
     out = {"articles": articles, "answer": None,
            "grounded": grounded, "best_cos": round(best_cos, 3)}
 
-    # CỔNG 1: kho không có gì đủ gần -> không gọi LLM. Vừa chặn bịa, vừa đỡ quota.
+    # Cổng 1: kho không có gì đủ gần thì không gọi LLM. Vừa chặn bịa ở gốc, vừa
+    # tiết kiệm hạn mức.
     if not articles or not generate or not grounded:
         return out
 
@@ -284,9 +317,9 @@ def ask(query: str, top_k: int = TOP_K, generate: bool = True,
         f"---\nCÂU HỎI: {query}"
     )
     answer = (_generate(KeyPool(max_wait=MAX_WAIT), prompt) or "").strip()
-    if NO_DATA in answer or not answer:      # CỔNG 2: model tự khai không đủ căn cứ
+    if NO_DATA in answer or not answer:      # cổng 2: mô hình tự khai thiếu căn cứ
         return out
-    out["answer"] = _enforce_citations(answer, len(articles))   # CỔNG 3
+    out["answer"] = _enforce_citations(answer, len(articles))   # cổng 3
     return out
 
 

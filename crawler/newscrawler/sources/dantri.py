@@ -1,9 +1,13 @@
 """Parser Dân trí (https://dantri.com.vn).
 
-Khó nhất: class Tailwind `dt-*` KHÔNG ổn định, có 2 layout (thường +
-e-magazine), KHÔNG có meta published_time. Chiến lược: dựa vào meta chuẩn
-(og:image, keywords), thẻ <time> ("Thứ ba, 07/07/2026 - 06:01"), wrapper
-ngữ nghĩa còn sót (e-magazine__body), và fallback mật độ <p>.
+Đây là nguồn khó bóc tách nhất trong dự án, vì ba lý do cùng lúc: class Tailwind
+dạng `dt-*` không ổn định giữa các lần build, trang tồn tại hai layout khác nhau
+(bài thường và e-magazine), và không có thẻ meta `published_time`.
+
+Cách xử lý là không phụ thuộc vào class trình bày, mà dựa vào những điểm neo ổn
+định hơn: các thẻ meta chuẩn (og:image, keywords), thẻ <time> cho ngày giờ, các
+wrapper còn mang ngữ nghĩa như `e-magazine__body`, và cuối cùng là phương án dự
+phòng chọn khối có mật độ <p> cao nhất.
 """
 from __future__ import annotations
 

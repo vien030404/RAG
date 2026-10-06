@@ -1,8 +1,12 @@
-"""Lưu HTML thô (nén gzip) vào bucket `raw` trên MinIO — tầng raw của lakehouse.
+"""Lưu HTML thô đã nén gzip vào bucket `raw` trên MinIO.
 
-Mỗi trang bài -> 1 object: raw/source=<src>/dt=<YYYY-MM-DD>/<url_hash>.html.gz
-Đây là object thường (không phải Iceberg), cho phép re-parse lại về sau mà
-không cần crawl lại.
+Mỗi trang bài thành một object:
+
+    raw/source=<nguồn>/dt=<YYYY-MM-DD>/<url_hash>.html.gz
+
+Đây là object thường, không phải bảng Iceberg. Giữ lại bản HTML gốc cho phép
+parse lại toàn bộ dữ liệu khi selector thay đổi hoặc khi phát hiện lỗi bóc tách,
+mà không phải cào lại các nguồn.
 """
 import gzip
 import os
@@ -25,7 +29,7 @@ def _client():
             aws_access_key_id=os.getenv("MINIO_ACCESS_KEY", "minioadmin"),
             aws_secret_access_key=os.getenv("MINIO_SECRET_KEY", "minioadmin"),
             region_name=os.getenv("AWS_REGION", "us-east-1"),
-            # MinIO cần path-style (bucket trong path, không phải subdomain)
+            # MinIO yêu cầu path-style: bucket nằm trong path, không phải subdomain
             config=Config(s3={"addressing_style": "path"}),
         )
     return _s3
@@ -47,9 +51,10 @@ def save_raw_html(source: str, url_hash: str, html: str, when: datetime | None =
 
 
 def load_raw_html(source: str, url_hash: str, when: datetime) -> str | None:
-    """Đọc lại HTML thô đã lưu. `when` là ngày CRAWL (crawled_at), không phải ngày đăng.
+    """Đọc lại HTML thô đã lưu.
 
-    Trả None nếu không có object — bài cào trước khi bật lưu raw, hoặc lệch ngày.
+    `when` là ngày cào (`crawled_at`) chứ không phải ngày đăng, vì key được đặt
+    theo thời điểm ghi object. Trả về None khi object không tồn tại.
     """
     key = f"source={source}/dt={when:%Y-%m-%d}/{url_hash}.html.gz"
     try:

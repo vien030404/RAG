@@ -14,17 +14,17 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-REQUEST_DELAY = 1.0    # giây nghỉ giữa các request (lịch sự với server)
+REQUEST_DELAY = 1.0    # giây giãn cách giữa hai request tới cùng một nguồn
 REQUEST_TIMEOUT = 15   # giây
 MAX_RETRIES = 3
 
 # Phạm vi crawl
-MAX_PAGES = 20   # TRẦN số trang listing / category. crawl_category tự dừng sớm
-                 # khi 1 trang không còn bài nào của target_date (xét ngày MAX
-                 # trên trang) — trần cao chỉ để phủ hết ngày tin nhiều.
-                 # (0 hoặc None = không cào; >=1)
-# Không giới hạn số bài mỗi category (lấy hết bài trên mỗi trang listing).
+#
+# Trần số trang listing duyệt cho mỗi chuyên mục. `crawl_category` dừng sớm khi
+# một trang không còn bài nào thuộc `target_date` (so theo ngày mới nhất trên
+# trang), nên trần đặt cao chỉ để phủ hết những ngày nhiều tin.
+MAX_PAGES = 20
 
-# Bỏ bài không có nội dung text (video / trang không phải bài viết).
-# Bài thật luôn > vài trăm ký tự; video parse ra content rỗng.
+# Ngưỡng loại trang không phải bài viết: trang video và trang chuyên mục parse
+# ra nội dung rỗng, trong khi bài thật luôn dài hơn vài trăm ký tự.
 MIN_CONTENT_LEN = 100

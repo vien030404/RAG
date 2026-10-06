@@ -1,8 +1,9 @@
-"""Xem nhanh bảng Iceberg dưới dạng bảng / xuất CSV.
+"""Xem nhanh bảng Iceberg dưới dạng bảng văn bản, hoặc xuất ra CSV.
 
-Không đọc thẳng file Parquet trên MinIO: Silver ghi bằng `overwrite` nên Parquet
-của snapshot cũ vẫn nằm đó — đọc thô sẽ ra dữ liệu trùng/cũ. Đi qua PyIceberg để
-nó giải đúng snapshot hiện hành.
+Module cố ý không đọc thẳng file Parquet trên MinIO. Các công cụ sửa dữ liệu ghi
+bằng `overwrite`, nên file Parquet của những snapshot cũ vẫn còn nguyên trong
+bucket; đọc thô ở mức file sẽ trả về cả dữ liệu đã bị thay thế. Đi qua PyIceberg
+để lớp metadata giải đúng snapshot hiện hành.
 
     # 10 bài mới nhất
     docker compose run --rm crawler -m newscrawler.peek
@@ -99,7 +100,7 @@ def _stats(tb: pa.Table) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Xem bảng Iceberg (Bronze/Silver)")
+    ap = argparse.ArgumentParser(description="Xem nhanh bảng Iceberg bronze.articles")
     ap.add_argument("--table", default="bronze.articles", help="mặc định bronze.articles")
     ap.add_argument("-n", "--limit", dest="n", type=int, default=10,
                     help="số dòng (0 = tất cả)")
@@ -163,8 +164,9 @@ def main() -> None:
         return
 
     # --- sắp xếp mới -> cũ --------------------------------------------------
-    # Sắp bằng pyarrow, không dùng sorted() với key đọc cột — gọi to_pylist()
-    # trong key function sẽ materialize lại cả cột ở MỖI lần so sánh.
+    # Sắp xếp bằng pyarrow thay vì `sorted()` với key đọc từ cột: gọi
+    # `to_pylist()` bên trong key function sẽ materialize lại cả cột ở mỗi lần
+    # so sánh.
     if "published_at" in names:
         tb = tb.sort_by([("published_at", "descending")])
 
@@ -177,7 +179,7 @@ def main() -> None:
         out = tb if args.n == 0 else tb.slice(0, args.n)
         if args.cols:
             out = out.select([c.strip() for c in args.cols.split(",")])
-        # CSV không ghi được cột mảng (vd `tags`) -> nối thành chuỗi
+        # CSV không biểu diễn được cột kiểu mảng như `tags`, nên nối thành chuỗi.
         for i, field in enumerate(out.schema):
             if pa.types.is_list(field.type) or pa.types.is_large_list(field.type):
                 joined = ["; ".join(str(x) for x in (v or []))
@@ -198,7 +200,8 @@ def main() -> None:
     data = {c: tb.column(c).to_pylist()[:limit] for c in cols}
     rows = [{c: data[c][i] for c in cols} for i in range(limit)]
 
-    # cột text dài thì cắt bớt, cột ngắn thì vừa nội dung
+    # Cột text dài bị cắt bớt cho vừa khung terminal; cột ngắn giữ đúng độ rộng
+    # nội dung để bảng không bị dàn thưa.
     widths = {}
     for c in cols:
         longest = max((len(str(r.get(c, ""))) for r in rows), default=0)

@@ -1,11 +1,14 @@
-"""Giao diện tìm tin Streamlit — hiển thị THẺ BÀI BÁO, không phải hội thoại.
+"""Giao diện tìm tin viết bằng Streamlit, trình bày theo thẻ bài báo.
 
-Phần chính luôn là danh sách bài có thật trong kho: ảnh, tiêu đề, sapo, tác giả,
-link. Tóm tắt của LLM chỉ là phần PHỤ, và bị ẩn hẳn khi model tự khai không đủ
-căn cứ — thà không có tóm tắt còn hơn có tóm tắt bịa.
+Giao diện cố ý không phải khung hội thoại. Phần chính luôn là danh sách bài thực
+có trong kho — ảnh, tiêu đề, sapo, tác giả, link — còn đoạn tóm tắt do LLM sinh
+ra chỉ là phần phụ và bị ẩn hoàn toàn khi mô hình không đủ căn cứ. Với dữ liệu
+tin tức, không có tóm tắt là trạng thái tốt hơn một tóm tắt không kiểm chứng
+được.
 
-Không chứa logic truy hồi — gọi thẳng `newscrawler.ask`, nên UI và CLI luôn cho
-cùng kết quả. Đặt NGOÀI package vì `streamlit run` chạy file như `__main__`.
+Module không chứa logic truy hồi nào: nó gọi thẳng `newscrawler.ask`, nhờ đó
+giao diện và CLI luôn trả về cùng kết quả cho cùng câu hỏi. File nằm ngoài
+package vì `streamlit run` nạp nó như `__main__`.
 
     docker compose --profile chat up -d chatbot     # http://localhost:8501
 """
@@ -28,14 +31,17 @@ st.markdown("""<style>
 
 @st.cache_data(ttl=600, show_spinner=False)
 def vocabulary() -> tuple[list[str], list[str]]:
-    """Nguồn & chuyên mục CÓ THẬT trong kho — dropdown không đưa ra lựa chọn
-    dẫn tới 0 kết quả. Chỉ đọc 2 cột nên rất nhẹ."""
+    """Danh sách nguồn và chuyên mục thực có trong kho.
+
+    Dropdown dựng từ dữ liệu thật nên không bao giờ đưa ra một lựa chọn chắc
+    chắn trả về 0 kết quả. Chỉ đọc hai cột nên chi phí không đáng kể.
+    """
     try:
         tb = (_catalog().load_table(BRONZE_IDENT)
               .scan(selected_fields=("source", "category")).to_arrow())
         return (sorted({s for s in tb.column("source").to_pylist() if s}),
                 sorted({c for c in tb.column("category").to_pylist() if c}))
-    except Exception:                      # Bronze chưa sẵn sàng
+    except Exception:                      # Bronze chưa tồn tại hoặc chưa kết nối được
         return [], []
 
 
@@ -43,8 +49,9 @@ def render_card(a: dict) -> None:
     img, txt = st.columns([1, 4], vertical_alignment="top")
     with img:
         if a["thumbnail_url"]:
-            # Streamlit ghim 1.39: tham số là `use_column_width`;
-            # `use_container_width` chỉ có từ 1.40 trở lên.
+            # Phiên bản Streamlit ghim trong requirements là 1.39, nơi tham số
+            # còn tên `use_column_width`; `use_container_width` chỉ xuất hiện từ
+            # 1.40 trở đi.
             st.image(a["thumbnail_url"], use_column_width=True)
         else:
             st.caption("(không có ảnh)")
@@ -57,7 +64,7 @@ def render_card(a: dict) -> None:
         if a["description"]:
             st.markdown(f"<div class='card-desc'>{a['description']}</div>",
                         unsafe_allow_html=True)
-        # tác giả: ưu tiên người viết; không có thì ghi hãng tin đã dẫn lại
+        # Ưu tiên hiện tên người viết; không có thì hiện hãng tin được dẫn lại.
         who = a["author_name"] or ", ".join(a["source_attribution"])
         meta = [f"**{a['source']}**", a["date"] or "—", a["category"] or "—"]
         if who:
@@ -125,8 +132,9 @@ if q:
     try:
         with st.spinner("Đang tìm…"):
             out = ask(q, generate=want_summary, **kw)
-    # embed_texts / _generate ném SystemExit khi mọi key cạn quota — không bắt
-    # thì Streamlit chết cả script và người dùng thấy trang trắng.
+    # `embed_texts` và `_generate` ném SystemExit khi mọi key đã cạn hạn mức.
+    # Không bắt thì Streamlit dừng cả script và người dùng chỉ thấy trang trắng
+    # thay vì một thông báo giải thích được.
     except SystemExit as e:
         st.error(f"Hết hạn ngạch Gemini — thử lại sau khi quota reset.\n\n```\n{e}\n```")
         st.stop()

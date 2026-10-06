@@ -1,3 +1,9 @@
+"""Phiên HTTP dùng chung cho mọi nguồn, có retry và giãn nhịp request.
+
+Một `requests.Session` duy nhất cho cả tiến trình để tái dùng kết nối TCP.
+`Retry` tự thử lại các mã tạm thời (429 và 5xx) với backoff luỹ tiến; mã 4xx
+khác được trả về nguyên trạng để lớp gọi tự quyết định.
+"""
 import time
 import requests
 from requests.adapters import HTTPAdapter
@@ -26,7 +32,7 @@ _session = _build_session()
 
 
 def fetch(url: str) -> tuple[str | None, int]:
-    """Returns (html, http_status_code). html is None on error."""
+    """Tải một trang. Trả về (html, mã HTTP); html là None khi thất bại."""
     try:
         response = _session.get(url, timeout=REQUEST_TIMEOUT)
         status = response.status_code
@@ -36,8 +42,8 @@ def fetch(url: str) -> tuple[str | None, int]:
         return response.text, status
     except requests.HTTPError as e:
         status = e.response.status_code if e.response is not None else 0
-        print(f"[fetcher] HTTP {status} for {url}")
+        print(f"[fetcher] HTTP {status}: {url}")
         return None, status
     except requests.RequestException as e:
-        print(f"[fetcher] Error fetching {url}: {e}")
+        print(f"[fetcher] lỗi khi tải {url}: {e}")
         return None, 0

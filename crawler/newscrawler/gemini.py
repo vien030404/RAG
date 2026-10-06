@@ -1,37 +1,37 @@
-"""Bể API key Gemini — xoay vòng khi một key hết quota.
+"""Bể API key Gemini với hạn mức token theo phút.
 
-CẢNH BÁO: quota Gemini tính theo PROJECT chứ không theo key. Nhiều key cùng một
-project sẽ dùng chung hạn mức và xoay vòng hoàn toàn vô ích. Chỉ cộng dồn được
-khi các key thuộc project / tài khoản khác nhau.
+Hạn mức Gemini tính trên từng project, không trên từng key: nhiều key thuộc cùng
+một project chia nhau một hạn mức, nên xoay vòng giữa chúng không tăng thông
+lượng. Chỉ cộng dồn được khi mỗi key thuộc một project khác nhau.
 
 Cấu hình (.env):
     GEMINI_API_KEYS=key1,key2,key3      # ưu tiên; phân tách bằng dấu phẩy
-    GEMINI_API_KEY=key1                 # tương thích ngược, dùng khi trên trống
+    GEMINI_API_KEY=key1                 # dùng khi biến trên để trống
 
-Cơ chế: NGÂN SÁCH TOKEN THEO PHÚT, không phải "cứ gửi rồi dính 429 mới đổi key".
-Ràng buộc thật của free tier là token/phút (TPM), nên mỗi key giữ một cửa sổ
-trượt 60 giây ghi lại đã tiêu bao nhiêu token; `acquire(tokens)` chỉ trả về key
-còn đủ chỗ cho lô sắp gửi, không có key nào đủ thì CHỜ tới lúc cửa sổ nhả ra.
-Nhờ vậy đường đi bình thường không còn sinh 429 nào. `penalize()` chỉ còn là
-lưới an toàn cho trường hợp ước lượng token hụt so với cách Gemini đếm.
+Đặt chỗ theo ngân sách token
+----------------------------
+Ràng buộc thực tế của free tier là token mỗi phút (TPM), không phải số lần gọi.
+Mỗi key vì vậy giữ một cửa sổ trượt 60 giây ghi lại lượng token đã tiêu;
+`acquire(tokens)` chỉ trả về key còn đủ chỗ cho lô sắp gửi và chờ nếu chưa key
+nào đủ. Cách này giữ cho đường đi bình thường không sinh 429, để `penalize()`
+còn lại đúng vai trò lưới an toàn khi ước lượng token thấp hơn bộ đếm của Gemini.
 
-Đo trên chính dữ liệu này: 1 lô 50 chunk ≈ 26.000 token qua được, nhưng lô thứ
-hai cùng key trong cùng phút thì 429 -> trần rơi vào khoảng 30.000 token/phút.
+Hai trần tách biệt
+------------------
+TPM, đo trên tập dữ liệu của dự án: một lô 50 chunk (khoảng 26.000 token) qua
+được, nhưng lô thứ hai trên cùng key trong cùng phút bị từ chối — trần nằm quanh
+30.000 token/phút. Ngân sách bên dưới xử lý trần này.
 
-CÓ HAI TRẦN, và cái thứ hai KHÔNG lách được bằng nhịp gửi:
+RPD, `EmbedContentRequestsPerDayPerUserPerProjectPerModel-FreeTier`: 1.000 mỗi
+ngày mỗi project (model gemini-embedding-1.0). Bộ đếm tăng theo từng phần tử
+`contents` chứ không theo lần gọi HTTP — 8.830 chunk chia cho 8 project (khoảng
+1.104 mỗi project) vượt trần, trong khi tổng số lần gọi HTTP chỉ khoảng 500
+(khoảng 62 mỗi project). Gộp lô do đó không nới được trần ngày; sức chứa thực là
 
-    quotaId : EmbedContentRequestsPerDayPerUserPerProjectPerModel-FreeTier
-    limit   : 1000 / ngày / project   (model gemini-embedding-1.0)
+    số project × 1.000 chunk/ngày
 
-Bộ đếm này tăng theo TỪNG `contents` item, không phải theo mỗi lần gọi HTTP —
-suy ra từ số đo: 8.830 chunk chia đều 8 project ≈ 1.104/project, vừa vượt 1.000,
-trong khi tổng số lần gọi HTTP chỉ ~500 (≈62/project, còn xa 1.000). Nghĩa là
-gộp lô KHÔNG kéo dài được ngân sách ngày; sức chứa thật là
-
-    số project × 1000 chunk/ngày
-
-Ngân sách token bên dưới chỉ giải quyết trần TPM (theo phút). Hết trần ngày thì
-phải đợi reset, không có cách nào khác ngoài tăng số project hoặc trả phí.
+Khi hết trần ngày, nhịp gửi không còn ý nghĩa: chỉ còn cách đợi reset, thêm
+project, hoặc chuyển sang gói trả phí.
 """
 from __future__ import annotations
 
@@ -44,18 +44,18 @@ from google import genai
 COOLDOWN = int(os.getenv("GEMINI_KEY_COOLDOWN", "60"))
 
 WINDOW = 60.0
-# Trần TPM SUY RA TỪ QUAN SÁT (Google không công bố con số cho từng model), nên
-# để chỉnh được từ .env thay vì đóng cứng.
+# Google không công bố TPM cho từng model; giá trị dưới đây suy ra từ đo đạc nên
+# để cấu hình được qua .env thay vì đóng cứng.
 TPM_LIMIT = int(os.getenv("GEMINI_TPM_LIMIT", "30000"))
-# Chỉ tiêu một phần trần: `est_tokens` là ước lượng (ký tự / 3) nên có thể hụt so
-# với bộ đếm thật của Gemini; phần dư này chính là biên an toàn.
+# Chỉ tiêu một phần trần. `est_tokens` là ước lượng (ký tự / 3) nên có thể thấp
+# hơn bộ đếm của Gemini; phần dư là biên an toàn.
 TPM_SAFETY = float(os.getenv("GEMINI_TPM_SAFETY", "0.8"))
 RPM_LIMIT = int(os.getenv("GEMINI_RPM_LIMIT", "100"))
 
 _BUDGET = TPM_LIMIT * TPM_SAFETY
 
-# Chuỗi nhận diện lỗi hết quota / rate-limit (google-genai không phơi mã lỗi
-# riêng cho trường hợp này nên phải soi thông điệp).
+# Nhận diện lỗi hết hạn mức / rate-limit. google-genai không phơi mã lỗi riêng
+# cho trường hợp này, nên phải đối chiếu thông điệp.
 _QUOTA_MARKS = ("429", "RESOURCE_EXHAUSTED", "quota")
 
 
@@ -68,26 +68,26 @@ def _read_keys() -> list[str]:
     raw = os.getenv("GEMINI_API_KEYS", "").strip() or os.getenv("GEMINI_API_KEY", "").strip()
     seen, out = set(), []
     for k in (x.strip() for x in raw.split(",")):
-        if k and k not in seen:      # bỏ key lặp -> tránh ảo tưởng có nhiều quota
+        if k and k not in seen:      # key trùng không cộng thêm hạn mức nào
             seen.add(k)
             out.append(k)
     return out
 
 
 class KeyPool:
-    """Vòng xoay client Gemini. Không bao giờ in key ra log, chỉ in số thứ tự."""
+    """Vòng xoay client Gemini. Log chỉ in số thứ tự key, không in giá trị key."""
 
     def __init__(self, keys: list[str] | None = None, max_wait: float | None = None):
-        # `max_wait`: chờ tối đa bao nhiêu giây cho một key rảnh trước khi BỎ CUỘC.
-        # None = chờ bao lâu cũng được (job embed chạy nền, chờ là đúng).
-        # Đường TƯƠNG TÁC (giao diện, CLI hỏi đáp) phải đặt số nhỏ: thà báo lỗi
-        # ngay còn hơn để người dùng nhìn spinner quay vài phút.
+        # `max_wait`: số giây tối đa chờ một key rảnh trước khi bỏ cuộc.
+        # None — chờ không giới hạn, phù hợp với job embed chạy nền.
+        # Đường tương tác (giao diện, CLI hỏi đáp) nên đặt giá trị nhỏ để báo lỗi
+        # sớm thay vì giữ người dùng trước spinner.
         self.max_wait = max_wait
         self.keys = _read_keys() if keys is None else keys
         if not self.keys:
             raise SystemExit("Thiếu GEMINI_API_KEYS / GEMINI_API_KEY (đặt trong .env).")
         self.clients = [genai.Client(api_key=k) for k in self.keys]
-        self.ready_at = [0.0] * len(self.keys)   # thời điểm key hết "nghỉ" (sau 429)
+        self.ready_at = [0.0] * len(self.keys)   # thời điểm key hết nghỉ sau 429
         # Cửa sổ trượt 60s: (thời điểm gửi, số token) của từng request theo key.
         self.window: list[deque[tuple[float, int]]] = [deque() for _ in self.keys]
         self.i = -1
@@ -117,12 +117,11 @@ class KeyPool:
         return max(t0, now + WINDOW)
 
     def acquire(self, tokens: int = 0) -> tuple[int, genai.Client]:
-        """Trả về key CÒN ĐỦ NGÂN SÁCH cho lô `tokens`, chờ nếu chưa có.
+        """Trả về key còn đủ ngân sách cho lô `tokens`, chờ nếu chưa key nào đủ.
 
-        Đặt chỗ trước thay vì gửi bừa: mỗi lượt gọi ghi luôn `tokens` vào cửa sổ
-        của key được chọn, nên hai lô liên tiếp không bao giờ dồn quá trần trong
-        cùng một phút. Xoay vòng từ key kế tiếp để tải trải đều, không dồn hết
-        vào key đầu rồi mới nhảy sang key sau.
+        Token được ghi vào cửa sổ của key ngay lúc cấp phát, nên hai lô liên
+        tiếp không thể cùng vượt trần trong một phút. Vòng quét bắt đầu từ key
+        kế tiếp để tải trải đều thay vì dồn vào key đầu danh sách.
         """
         n = len(self.keys)
         waited = 0.0
@@ -159,11 +158,11 @@ class KeyPool:
             print(f"  [gemini] {n} key đều đầy tải, chờ {wait:.0f}s")
             time.sleep(wait)
 
-    # Giữ tên cũ cho chỗ nào chỉ cần một key, không quan tâm ngân sách.
+    # Lối gọi rút gọn cho nơi chỉ cần một client, không ràng buộc ngân sách.
     def current(self) -> tuple[int, genai.Client]:
         return self.acquire()
 
     def penalize(self, seconds: float = COOLDOWN) -> None:
-        """Key hiện tại dính 429 -> cho nghỉ. Việc chọn key kế do `acquire` lo."""
+        """Cho key hiện tại nghỉ sau khi dính 429; `acquire` chọn key kế tiếp."""
         self.ready_at[self.i] = time.time() + seconds
         print(f"  [gemini] key #{self.i + 1} hết quota, nghỉ {seconds:.0f}s")

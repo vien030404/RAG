@@ -27,7 +27,8 @@ BRONZE_NAMESPACE = os.getenv("BRONZE_NAMESPACE", "bronze")
 BRONZE_TABLE = os.getenv("BRONZE_TABLE", "articles")
 TABLE_IDENT = f"{BRONZE_NAMESPACE}.{BRONZE_TABLE}"
 
-# Explicit Arrow schema → stable Iceberg schema, independent of batch contents
+# Khai báo schema Arrow tường minh để schema Iceberg ổn định, không phụ thuộc
+# vào nội dung của lô dữ liệu đầu tiên ghi vào bảng.
 # (avoids null-type inference when a column happens to be all-null in a batch).
 SCHEMA = pa.schema([
     ("url_hash", pa.string()),
@@ -65,7 +66,7 @@ def _catalog_conn() -> RestCatalog:
             **{
                 "uri": os.getenv("ICEBERG_REST_URI", "http://iceberg-rest:8181"),
                 "warehouse": os.getenv("ICEBERG_WAREHOUSE", "s3://warehouse/"),
-                # Use pyarrow FileIO so no extra fsspec/s3fs deps are needed.
+                # Dùng FileIO của pyarrow để không cần thêm fsspec hay s3fs.
                 "py-io-impl": "pyiceberg.io.pyarrow.PyArrowFileIO",
                 "s3.endpoint": os.getenv("MINIO_ENDPOINT", "http://minio:9000"),
                 "s3.access-key-id": os.getenv("MINIO_ACCESS_KEY", "minioadmin"),
@@ -127,16 +128,19 @@ def _to_row(a: Article) -> dict:
 
 
 def known_published_dates(source_name: str) -> dict[str, str]:
-    """`url_hash` -> ngày xuất bản của các bài ĐÃ có trong Bronze cho 1 nguồn.
+    """Trả về {url_hash: ngày xuất bản} của những bài đã có trong Bronze.
 
-    Dùng để bỏ qua bài đã cào khi DAG chạy lại cùng một ngày (run bị dồn, retry,
-    trigger tay). Trước đây trạng thái chống trùng chỉ nằm trong RAM của tiến
-    trình nên container mới không biết gì -> cào lại từ đầu.
+    Đây là trạng thái chống trùng của crawler, và nó phải nằm trong bảng chứ
+    không nằm trong bộ nhớ tiến trình: mỗi lượt crawl chạy trong một container
+    mới, nên trạng thái trong RAM sẽ mất và bài đã cào bị cào lại từ đầu mỗi khi
+    DAG chạy lại cùng một ngày — lúc run bị dồn, lúc retry, hay khi trigger tay.
 
-    Trả kèm NGÀY (không chỉ tập url_hash) để logic dừng phân trang vẫn tính được
-    `newest_on_page` cho những link bị bỏ qua — nếu không sẽ dừng sai.
+    Hàm trả về cả ngày xuất bản chứ không chỉ tập `url_hash`, để logic dừng phân
+    trang vẫn tính được `newest_on_page` cho những link đã bỏ qua. Thiếu thông
+    tin đó, vòng lặp sẽ dừng sai thời điểm.
 
-    Lọc theo `source` nên 4 task nguồn chạy song song không giẫm chân nhau.
+    Kết quả lọc theo `source`, nên các task của từng nguồn chạy song song không
+    ảnh hưởng lẫn nhau.
     """
     try:
         table = _catalog_conn().load_table(TABLE_IDENT)
@@ -161,7 +165,8 @@ def save_articles(
     if not articles:
         return 0
 
-    # Dedup theo article_id trong batch (cùng bài, nhiều URL)
+    # Khử trùng theo `article_id` trong phạm vi lô: cùng một bài có thể xuất
+    # hiện dưới nhiều URL khác nhau trên các trang listing.
     seen: set[int] = set()
     rows: list[dict] = []
     for a in articles:
@@ -176,8 +181,9 @@ def save_articles(
     catalog = _catalog_conn()
     _ensure_table(catalog)  # đảm bảo namespace + bảng tồn tại
 
-    # Nhiều task nguồn có thể append song song vào cùng bảng -> commit có thể
-    # xung đột (CAS trên REST catalog). Reload metadata mới nhất & thử lại.
+    # Các task của nhiều nguồn append song song vào cùng một bảng, nên commit có
+    # thể xung đột — REST catalog dùng compare-and-swap trên con trỏ metadata.
+    # Cách xử lý là nạp lại metadata mới nhất rồi thử lại.
     last_err: Exception | None = None
     for attempt in range(_COMMIT_RETRIES):
         try:

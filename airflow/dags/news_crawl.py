@@ -1,16 +1,19 @@
-"""Daily multi-source news crawl → raw HTML + Iceberg Bronze (`bronze.articles`).
+"""DAG cào tin hằng ngày: nhiều nguồn -> HTML thô + Iceberg Bronze -> Qdrant.
 
-Chạy image `crawler:0.1` như sibling container (DockerOperator). Mỗi NGUỒN là 1
-mapped task chạy **song song** (dynamic task mapping) → nhanh hơn & cô lập lỗi:
-1 báo hỏng không kéo theo báo khác, retry riêng, log riêng từng nguồn.
+Mỗi task chạy image `crawler:0.1` như một sibling container thông qua
+DockerOperator. Bước crawl dùng dynamic task mapping, một mapped task cho mỗi
+nguồn, chạy song song. Cách chia này vừa nhanh hơn vừa cô lập lỗi: một báo đổi
+layout hay chặn request không kéo theo các báo còn lại, và mỗi nguồn có log cùng
+lịch retry riêng.
 
-Mỗi task ghi **1 append / nguồn** vào bảng thống nhất `bronze.articles`
-(phân biệt qua cột `source`); `storage.save_articles` tự retry nếu commit trùng
-khi các task ghi đồng thời.
+Mỗi task ghi một lần append cho nguồn của nó vào bảng dùng chung
+`bronze.articles`, phân biệt qua cột `source`. Khi các task commit đồng thời,
+`storage.save_articles` tự thử lại nếu gặp xung đột.
 
-Schedule: 02:00 mỗi ngày. KHÔNG truyền logical date; crawler tự lấy "hôm qua"
-theo giờ VN tại thời điểm container chạy. Đặt Airflow Variable `crawl_date`
-(YYYY-MM-DD | all) để override khi cần backfill / crawl toàn bộ.
+Lịch chạy 02:00 mỗi ngày. DAG không truyền logical date xuống crawler: crawler
+tự lấy ngày hôm trước theo giờ Việt Nam tại thời điểm container chạy. Để cào một
+ngày khác hoặc cào toàn bộ, đặt Airflow Variable `crawl_date` theo định dạng
+YYYY-MM-DD hoặc giá trị "all".
 """
 from __future__ import annotations
 
@@ -21,10 +24,12 @@ import pendulum
 from airflow import DAG
 from airflow.providers.docker.operators.docker import DockerOperator
 
-# Múi giờ Việt Nam để "2h sáng" là giờ địa phương (không phải UTC).
+# Khai báo múi giờ Việt Nam để mốc 02:00 trong `schedule` là giờ địa phương chứ
+# không phải UTC.
 LOCAL_TZ = pendulum.timezone("Asia/Ho_Chi_Minh")
 
-# Compose network để crawler resolve `minio`/`iceberg-rest` như sibling container.
+# Mạng của compose stack. Task phải nằm trong mạng này để phân giải được các tên
+# `minio` và `iceberg-rest` khi chạy như sibling container.
 LAKEHOUSE_NETWORK = os.getenv("LAKEHOUSE_DOCKER_NETWORK", "project-1_lakehouse")
 
 ICEBERG_REST_URI = os.getenv("LAKEHOUSE_ICEBERG_REST_URI", "http://iceberg-rest:8181")
@@ -49,14 +54,17 @@ EMBED_BATCH = os.getenv("EMBED_BATCH", "40")
 GEMINI_EMBED_MODEL = os.getenv("GEMINI_EMBED_MODEL", "gemini-embedding-001")
 EMBED_DIM = os.getenv("EMBED_DIM", "768")
 
-# Phải khớp registry newscrawler/sources (SOURCES).
-# dantri VẪN GỠ. Kiểm tra 2026-09-04: blackhole IP cũ đã hết (trang chủ + trang
-# listing trả HTTP 200), nhưng trang BÀI nay có bot protection — request đầu
-# 200, các request sau trả HTTP 428 tức thì kể cả khi giãn 3s/request. Đó là
-# chính sách truy cập của trang, không phải lỗi mạng; không lách.
+# Danh sách này phải khớp registry SOURCES trong `newscrawler/sources`.
+#
+# dantri nằm ngoài danh sách. Trang chủ và trang listing vẫn trả HTTP 200, nhưng
+# trang bài có cơ chế chống bot: request đầu thành công, các request sau trả
+# HTTP 428 ngay lập tức, kể cả khi giãn nhịp lên 3 giây mỗi request. Đây là
+# chính sách truy cập của trang chứ không phải sự cố mạng, nên nguồn được bỏ ra
+# thay vì tìm cách đi vòng. Parser `sources/dantri.py` vẫn giữ lại để dùng được
+# ngay nếu chính sách đó thay đổi.
 SOURCES = ["vnexpress", "vietnamnet", "tuoitre", "thanhnien"]
 
-# Kết nối catalog/object store — chung cho mọi task.
+# Thông tin kết nối catalog và object store, dùng chung cho mọi task.
 _STORAGE_ENV = {
     "ICEBERG_REST_URI": ICEBERG_REST_URI,
     "ICEBERG_WAREHOUSE": ICEBERG_WAREHOUSE,
@@ -71,21 +79,22 @@ _STORAGE_ENV = {
 _CRAWL_ENV = {
     **_STORAGE_ENV,
     "RAW_BUCKET": RAW_BUCKET,
-    # Rỗng => crawler tự lấy "hôm qua" theo giờ VN lúc container chạy.
-    # Đặt Airflow Variable `crawl_date` (YYYY-MM-DD | all) để override khi backfill.
+    # Để trống thì crawler tự lấy ngày hôm trước theo giờ Việt Nam tại thời
+    # điểm container chạy. Đặt Airflow Variable `crawl_date` theo định dạng
+    # YYYY-MM-DD, hoặc giá trị "all", để chỉ định ngày khác khi cào bù.
     "CRAWL_DATE": "{{ var.value.get('crawl_date', '') }}",
-    # rỗng => tất cả category; đặt Airflow Variable để giới hạn
+    # Để trống thì lấy mọi chuyên mục; đặt Airflow Variable để thu hẹp phạm vi.
     "CRAWL_CATEGORIES": "{{ var.value.get('crawl_categories', '') }}",
 }
 
-# Tham số Docker dùng chung cho mọi task (crawl + embed cùng 1 image).
+# Tham số Docker dùng chung: crawl và embed chạy trên cùng một image.
 _DOCKER_ARGS = dict(
     image="crawler:0.1",
-    force_pull=False,                 # image local, không ở registry
+    force_pull=False,                 # image build tại máy, không đẩy lên registry
     docker_url="unix://var/run/docker.sock",
     network_mode=LAKEHOUSE_NETWORK,
     auto_remove="force",
-    mount_tmp_dir=False,              # tránh lỗi host tmp bind-mount trên Docker Desktop
+    mount_tmp_dir=False,              # bind-mount tmp của host lỗi trên Docker Desktop
 )
 
 default_args = {
@@ -102,10 +111,11 @@ with DAG(
     catchup=False,
     default_args=default_args,
     max_active_runs=1,
-    max_active_tasks=5,              # tối đa 5 container crawler song song
+    max_active_tasks=5,              # trần số container chạy song song
     tags=["ingestion", "crawler", "multi-source"],
 ) as dag:
-    # 1 mapped task / nguồn: crawl[0..N] chạy song song, mỗi task 1 CRAWL_SOURCES.
+    # Một mapped task cho mỗi nguồn: crawl[0..N] chạy song song, mỗi task nhận
+    # đúng một giá trị CRAWL_SOURCES.
     crawl = DockerOperator.partial(
         task_id="crawl",
         **_DOCKER_ARGS,
@@ -113,8 +123,9 @@ with DAG(
         environment=[{**_CRAWL_ENV, "CRAWL_SOURCES": s} for s in SOURCES],
     )
 
-    # Bronze -> chunk -> embedding (Gemini) -> Qdrant. Tăng dần: point id ổn định
-    # theo (source, article_id, chunk_idx) nên chỉ embed bài mới / bài đổi nội dung.
+    # Bronze -> chunk -> embedding -> Qdrant, chạy tăng dần. Point id ổn định
+    # theo (source, article_id, chunk_idx), nên chỉ những bài mới hoặc bài đã
+    # đổi nội dung mới phải gọi API.
     embed = DockerOperator(
         task_id="embed",
         command=["-m", "newscrawler.embed"],

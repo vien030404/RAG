@@ -18,13 +18,14 @@ from bs4 import BeautifulSoup
 
 from ..article import Article
 
-TZ_VN = timezone(timedelta(hours=7))  # published_at lưu UTC; gắn +7 rồi để storage đổi UTC
+TZ_VN = timezone(timedelta(hours=7))  # gắn +7 vào giờ đọc từ trang; storage đổi sang UTC
 _DATE_RE = re.compile(r"(\d{1,2})/(\d{1,2})/(\d{4})(?:[^\d]+(\d{1,2}):(\d{2}))?")
-_DUR_RE = re.compile(r"^\d{1,2}:\d{2}$")  # thời lượng video "01:38" (overlay nút play)
-# "Theo Kyiv Post" / "(Theo Reuters, AFP)" — nguồn bắt đầu chữ HOA để loại
-# "Theo dõi" (nút follow) và "theo giới phân tích..." (giữa câu).
+_DUR_RE = re.compile(r"^\d{1,2}:\d{2}$")  # thời lượng video dạng "01:38" trên overlay
+# Khớp "Theo Kyiv Post" hoặc "(Theo Reuters, AFP)". Tên nguồn buộc phải bắt đầu
+# bằng chữ hoa, nhờ đó loại được "Theo dõi" của nút follow và "theo giới phân
+# tích..." nằm giữa câu.
 _THEO_RE = re.compile(r"^\(?\s*Theo\s+([A-ZĐ][^.()]{1,40}?)\s*\)?\.?$")
-# Các nhãn "trang chủ" cần bỏ khỏi breadcrumb (nhiều biến thể giữa các báo).
+# Các nhãn chỉ trang chủ cần bỏ khỏi breadcrumb; mỗi báo dùng một biến thể khác nhau.
 _HOME_TERMS = {"trang chủ", "trang chu", "home", "tin tức mới nhất", "dantri.com.vn"}
 
 
@@ -39,12 +40,15 @@ class BaseSource(ABC):
         """Trả về danh sách URL bài viết từ trang listing."""
 
     def page_url(self, base_url: str, page: int) -> str | None:
-        """URL trang thứ N của 1 category, hoặc None nếu không hỗ trợ phân trang."""
+        """URL trang thứ N của một chuyên mục, hoặc None nếu báo không phân trang."""
         return base_url if page == 1 else None
 
     def more_page_urls(self, base_url: str, page1_html: str, max_pages: int) -> list[str]:
-        """URL các trang 2..max_pages của listing. Mặc định dựng từ page_url();
-        override khi cần thông tin trong page1_html (vd zoneId cho AJAX timeline)."""
+        """URL các trang 2..max_pages của một chuyên mục.
+
+        Mặc định dựng từ `page_url()`. Lớp con ghi đè khi cần thông tin nằm trong
+        HTML trang đầu, chẳng hạn zoneId của một timeline tải bằng AJAX.
+        """
         urls: list[str] = []
         for page in range(2, max_pages + 1):
             u = self.page_url(base_url, page)
@@ -56,7 +60,7 @@ class BaseSource(ABC):
     # ---------------------------------------------------------------- article
     @abstractmethod
     def parse_article(self, html: str, url: str) -> Article:
-        """Bóc tách 1 trang bài viết thành Article (đã gán self.name vào source)."""
+        """Bóc tách một trang bài viết thành `Article`, với `source` đã được gán."""
 
     def new_article(self, url: str) -> Article:
         return Article(
@@ -66,15 +70,22 @@ class BaseSource(ABC):
         )
 
     def fill_hierarchy(self, soup: BeautifulSoup, article: Article) -> None:
-        """Điền sub_category / topic từ JSON-LD BreadcrumbList (chuẩn schema.org,
-        đồng nhất mọi báo). Sau khi bỏ nhãn "Trang chủ": [0]=category (đã có từ
-        listing), [1]=sub_category, [2]=topic.
+        """Điền `sub_category` và `topic` từ JSON-LD BreadcrumbList.
 
-        Đồng thời đánh dấu bài cần BỎ (main sẽ skip), chỉ giữ bài text thường:
-        - Định dạng đặc biệt (megastory tuoitre / e-magazine dantri): class
-          chứa 'magazine'/'megastory' -> crawl_status="special".
-        - Video: breadcrumb có cấp "Video" (vd Trang chủ > Video > Giải trí)
-          -> crawl_status="video"."""
+        Dùng BreadcrumbList vì đó là chuẩn schema.org và mọi báo trong dự án đều
+        phát ra, nên không cần selector riêng cho từng nguồn. Sau khi loại các
+        nhãn chỉ trang chủ, thứ tự các cấp là: [0] category — đã biết từ trang
+        listing, [1] sub_category, [2] topic.
+
+        Hàm cũng đánh dấu những bài cần loại để `main` bỏ qua, nhằm chỉ giữ bài
+        dạng văn bản thường:
+
+            crawl_status="special"   định dạng đặc biệt kiểu megastory hoặc
+                                     e-magazine, nhận ra qua class chứa
+                                     "magazine" hay "megastory"
+            crawl_status="video"     breadcrumb có một cấp là "Video", ví dụ
+                                     Trang chủ > Video > Giải trí
+        """
         if soup.select_one("[class*=magazine], [class*=megastory]"):
             article.crawl_status = "special"
             return
@@ -83,7 +94,7 @@ class BaseSource(ABC):
             article.crawl_status = "video"
             return
         crumbs = [c for c in raw if c.strip().lower() not in _HOME_TERMS]
-        # sub_category chỉ đặt khi KHÁC category (tránh trùng lặp "Giải trí")
+        # Chỉ đặt sub_category khi nó khác category, tránh lặp lại cùng một tên.
         if len(crumbs) >= 2 and crumbs[1].strip().lower() != crumbs[0].strip().lower():
             article.sub_category = crumbs[1]
         if len(crumbs) >= 3:
@@ -94,15 +105,19 @@ class BaseSource(ABC):
         self, html: str, seg_regex: str, exclude: tuple[str, ...] = (),
         skip_video: bool = True,
     ) -> list[str]:
-        """Tìm link bài theo pattern segment cuối URL (cùng domain, bỏ `exclude`).
-        skip_video=True: bỏ bài video (card có class ...video...) — chỉ có clip,
-        không có nội dung text."""
+        """Tìm link bài theo mẫu của segment cuối URL.
+
+        Chỉ nhận link cùng domain và loại những URL chứa chuỗi trong `exclude`.
+        Với `skip_video=True`, các card video cũng bị loại: chúng chỉ có clip nên
+        parse ra nội dung rỗng.
+        """
         soup = BeautifulSoup(html, "lxml")
         dom = urlparse(self.base_url).netloc
         rx = re.compile(seg_regex)
 
-        # Lượt 1: đánh dấu URL video (1 bài có nhiều <a>: thumb nằm trong card
-        # video, title thì không -> phải gom URL video qua BẤT KỲ <a> nào).
+        # Lượt 1: thu thập các URL video. Một bài có nhiều thẻ <a> trỏ tới nó,
+        # và chỉ thẻ bọc thumbnail nằm trong card video còn thẻ tiêu đề thì
+        # không, nên phải nhận diện qua bất kỳ thẻ <a> nào trỏ tới URL đó.
         video_urls: set[str] = set()
         if skip_video:
             for a in soup.find_all("a", href=True):
@@ -126,15 +141,18 @@ class BaseSource(ABC):
         return out
 
 
-# ------------------------- module-level pure helpers -------------------------
+# ------------------- hàm thuần, dùng chung ở cấp module ----------------------
 def md5(text: str) -> str:
     return hashlib.md5(text.encode()).hexdigest()
 
 
 def _is_video_card(a) -> bool:
-    """True nếu <a> là link video (loại bài chỉ có clip, vd Dân trí trộn video
-    vào listing tin). Dấu hiệu: text của <a> là thời lượng "01:38" (overlay nút
-    play), hoặc tổ tiên có class chứa 'video'."""
+    """Cho biết một thẻ <a> có trỏ tới bài chỉ có video hay không.
+
+    Nhiều báo trộn thẳng video vào trang listing tin. Hai dấu hiệu nhận ra:
+    text của <a> là thời lượng dạng "01:38" do overlay nút play sinh ra, hoặc
+    một thẻ tổ tiên mang class chứa "video".
+    """
     if _DUR_RE.match(a.get_text(strip=True)):
         return True
     node = a
@@ -147,24 +165,29 @@ def _is_video_card(a) -> bool:
     return False
 
 
-# Khoảng trắng "lạ" hay gặp trong HTML báo: nbsp, zero-width space.
+# Các loại khoảng trắng bất thường thường gặp trong HTML báo: nbsp và
+# zero-width space.
 _WS_RUN = re.compile(r"[ \t ​‌﻿]+")
-# Dấu cách vừa chèn vào SAI CHỖ: trước dấu đóng câu, sau dấu mở.
+# Dấu cách nằm sai chỗ sau khi chèn: ngay trước dấu đóng câu, hoặc ngay
+# sau dấu mở.
 _SP_BEFORE = re.compile(r"\s+([,.;:!?%…)\]}»”’])")
 _SP_AFTER = re.compile(r"([(\[{«“‘])\s+")
 
 
 def inline_text(el) -> str:
-    """Text của một thẻ, CÓ dấu cách giữa các thẻ con.
+    """Lấy text của một thẻ, có chèn dấu cách giữa các thẻ con.
 
-    `get_text(strip=True)` nối text của các con mà không chèn gì, nên
-    `<p>thông tấn<b>TASS</b>của Nga</p>` ra "thông tấnTASScủa Nga" — dính chữ.
-    Đo trên 5.033 bài: 68% số bài có ít nhất một chỗ dính, trung bình 3,5 chỗ.
-    Hậu quả: BM25 tách "tấnTASScủa" thành MỘT token nên tra "TASS" không ra.
+    `get_text(strip=True)` nối text của các thẻ con mà không chèn gì vào giữa,
+    nên `<p>thông tấn<b>TASS</b>của Nga</p>` cho ra "thông tấnTASScủa Nga". Đo
+    trên 5.033 bài thì 68% số bài có ít nhất một chỗ dính như vậy, trung bình
+    3,5 chỗ mỗi bài. Hệ quả nằm ở tầng truy hồi: BM25 coi "tấnTASScủa" là một
+    token duy nhất, nên tìm "TASS" không trả về bài đó.
 
-    Chèn dấu cách rồi dọn lại, vì chèn thô sẽ đẻ lỗi mới:
-      "Nga<b>,</b> nói"  ->  "Nga , nói"   -> phải thành "Nga, nói"
-      "(<b>Ảnh</b>: X)"  ->  "( Ảnh : X)"  -> phải thành "(Ảnh: X)"
+    Chèn dấu cách là cần thiết nhưng chèn thô lại sinh lỗi mới, vì vậy phải dọn
+    lại ngay sau đó:
+
+        "Nga<b>,</b> nói"  ->  "Nga , nói"   ->  "Nga, nói"
+        "(<b>Ảnh</b>: X)"  ->  "( Ảnh : X)"  ->  "(Ảnh: X)"
     """
     if el is None:
         return ""
@@ -205,7 +228,11 @@ def parse_iso(value: str) -> datetime | None:
 
 
 def parse_vn_datetime(value: str) -> datetime | None:
-    """"Thứ ba, 07/07/2026 - 06:01" | "07/07/2026 09:00 (GMT+07:00)" -> datetime(+7)."""
+    """Parse các dạng ngày giờ mà báo tiếng Việt dùng, trả về datetime múi +7.
+
+        "Thứ ba, 07/07/2026 - 06:01"
+        "07/07/2026 09:00 (GMT+07:00)"
+    """
     if not value:
         return None
     m = _DATE_RE.search(value)
@@ -221,8 +248,11 @@ def parse_vn_datetime(value: str) -> datetime | None:
 
 
 def join_paragraphs(container) -> tuple[str, int]:
-    """Ghép các <p> thành nội dung. Bỏ <p class=description> và <p> là caption
-    ảnh (nằm trong <figure>/<figcaption> — mọi báo đặt chú thích "Ảnh: ..." ở đó)."""
+    """Ghép các thẻ <p> thành nội dung bài.
+
+    Loại <p class=description> vì đó là sapo, đã nằm ở cột riêng, và loại các <p>
+    là chú thích ảnh — mọi báo đặt chúng trong <figure> hoặc <figcaption>.
+    """
     if container is None:
         return "", 0
     parts = []
@@ -230,9 +260,9 @@ def join_paragraphs(container) -> tuple[str, int]:
         classes = p.get("class") or []
         if "description" in classes:
             continue
-        if p.find_parent(["figure", "figcaption"]):   # caption ảnh -> bỏ
+        if p.find_parent(["figure", "figcaption"]):   # chú thích ảnh, bỏ
             continue
-        t = inline_text(p)          # chèn dấu cách giữa <b>/<i>/<a> rồi dọn
+        t = inline_text(p)          # chèn dấu cách giữa các thẻ inline rồi dọn
         if t:
             parts.append(t)
     content = "\n\n".join(parts)
@@ -240,7 +270,7 @@ def join_paragraphs(container) -> tuple[str, int]:
 
 
 def _iter_jsonld(data):
-    """Duyệt mọi dict trong JSON-LD (dict / list / lồng trong @graph)."""
+    """Duyệt mọi dict trong JSON-LD, kể cả dạng list và dạng lồng trong @graph."""
     stack = [data]
     while stack:
         cur = stack.pop()
@@ -253,7 +283,7 @@ def _iter_jsonld(data):
 
 
 def breadcrumb_from_jsonld(soup: BeautifulSoup) -> list[str]:
-    """Trích danh sách tên từ <script type=application/ld+json> BreadcrumbList."""
+    """Trích danh sách tên các cấp breadcrumb từ khối JSON-LD BreadcrumbList."""
     for sc in soup.find_all("script", type="application/ld+json"):
         raw = sc.string or sc.get_text() or ""
         try:
@@ -265,7 +295,7 @@ def breadcrumb_from_jsonld(soup: BeautifulSoup) -> list[str]:
                 continue
             names: list[str] = []
             for e in node.get("itemListElement", []):
-                if isinstance(e, list):        # Dân trí bọc mỗi item trong 1 list con
+                if isinstance(e, list):        # một số báo bọc mỗi item trong list con
                     e = e[0] if e else None
                 if not isinstance(e, dict):
                     continue
@@ -304,7 +334,10 @@ def _author_names(au) -> list[str]:
 
 
 def author_from_jsonld(soup: BeautifulSoup) -> str:
-    """Tên tác giả từ JSON-LD NewsArticle/Article `author` (Person) — chuẩn, sạch."""
+    """Tên tác giả lấy từ trường `author` kiểu Person trong JSON-LD NewsArticle.
+
+    Ưu tiên nguồn này vì nó đã được chuẩn hoá sẵn, không lẫn chức danh hay nhãn.
+    """
     for node in _jsonld_nodes(soup):
         if node.get("@type") in ("NewsArticle", "Article", "Report", "BlogPosting"):
             names = [n for n in _author_names(node.get("author")) if n.lower() != "dân trí"]
@@ -314,11 +347,14 @@ def author_from_jsonld(soup: BeautifulSoup) -> str:
 
 
 def theo_source(soup: BeautifulSoup) -> str:
-    """Nguồn gốc bài từ dòng "Theo <Nguồn>" cuối bài (bài dịch/quốc tế).
-    Trả về phần sau "Theo" (vd "Kyiv Post"), lấy cái xuất hiện sau cùng."""
+    """Nguồn gốc bài, lấy từ dòng "Theo <Nguồn>" ở cuối những bài dịch.
+
+    Trả về phần nằm sau chữ "Theo", ví dụ "Kyiv Post". Khi có nhiều dòng khớp
+    thì lấy dòng xuất hiện sau cùng, vì đó là vị trí ghi nguồn thật.
+    """
     found = ""
     for el in soup.find_all(["p", "div", "span"]):
-        if el.find(["p", "div"]):  # chỉ xét leaf ngắn
+        if el.find(["p", "div"]):  # chỉ xét node lá, bỏ khối lồng nhau
             continue
         m = _THEO_RE.match(el.get_text(" ", strip=True))
         if m:
@@ -327,7 +363,11 @@ def theo_source(soup: BeautifulSoup) -> str:
 
 
 def tightest_body(soup: BeautifulSoup):
-    """Fallback khi không có selector ổn định: div/article chứa nhiều text <p> nhất."""
+    """Phương án dự phòng khi nguồn không có selector ổn định.
+
+    Chọn thẻ div hoặc article chứa nhiều text trong các <p> nhất, dựa trên giả
+    định rằng khối nội dung chính luôn dài hơn mọi khối phụ.
+    """
     best = None
     best_len = 0
     for el in soup.find_all(["div", "article"]):
@@ -340,9 +380,10 @@ def tightest_body(soup: BeautifulSoup):
     return best
 
 
-# Bút danh tòa soạn / hãng tin / nhãn nội dung tài trợ — KHÔNG phải tên tác giả.
-# Đo trên dữ liệu thật: tuoitre ghi "TTXVN", dantri ghi "PV"/"Dân trí",
-# thanhnien ghi "Thông tin dịch vụ"/"Nguồn: Bệnh viện FV".
+# Bút danh toà soạn, tên hãng tin và nhãn nội dung tài trợ. Chúng xuất hiện ở
+# đúng vị trí của tên tác giả trên trang nhưng không phải tên người. Quan sát
+# trên corpus: Tuổi Trẻ ghi "TTXVN", Dân trí ghi "PV" hoặc "Dân trí", Thanh Niên
+# ghi "Thông tin dịch vụ" hoặc "Nguồn: Bệnh viện FV".
 _NOT_A_PERSON = {
     "ttxvn", "vna", "pv", "ctv", "nhóm pv", "nhóm phóng viên", "phóng viên",
     "dân trí", "tuổi trẻ", "thanh niên", "vnexpress", "vietnamnet",
@@ -354,15 +395,20 @@ _SRC_SPLIT_RE = re.compile(r"\s*[,/]\s*")
 
 
 def split_sources(raw) -> list[str]:
-    """"AFP, Reuters" -> ["AFP", "Reuters"] · "Health 2.0/TVBS" -> [...].
+    """Tách chuỗi nguồn dẫn thành danh sách tên hãng.
 
-    Vì sao phải tách: đo trên dữ liệu thật, 404/605 giá trị chứa nhiều hãng
-    trong MỘT chuỗi (tối đa 5), sinh ra hàng trăm chuỗi khác nhau cho vài chục
-    hãng có thật. Lọc `source_attribution = 'Reuters'` vì thế trượt hết những
-    bài ghi "AFP, Reuters". Thành mảng thì khớp theo PHẦN TỬ, giống `tags`.
+        "AFP, Reuters"      ->  ["AFP", "Reuters"]
+        "Health 2.0/TVBS"   ->  ["Health 2.0", "TVBS"]
 
-    Chỉ tách `,` và `/` — dữ liệu thật không dùng dấu phân cách nào khác, và
-    tách rộng hơn sẽ vỡ những tên vốn có dấu ("L'Équipe", "Health 2.0").
+    Lý do phải tách: trên corpus có 404 trong 605 giá trị chứa nhiều hãng gộp
+    trong một chuỗi, nhiều nhất là 5 hãng, sinh ra hàng trăm chuỗi khác nhau cho
+    chỉ vài chục hãng thực sự tồn tại. Khi đó điều kiện lọc
+    `source_attribution = 'Reuters'` bỏ sót toàn bộ những bài ghi "AFP, Reuters".
+    Chuyển sang mảng thì phép lọc khớp theo từng phần tử, giống cách `tags` hoạt
+    động.
+
+    Chỉ tách ở `,` và `/`. Corpus không dùng dấu phân cách nào khác, còn tách
+    rộng hơn sẽ làm vỡ những tên vốn chứa dấu như "L'Équipe" hay "Health 2.0".
     """
     if not raw:
         return []
@@ -373,18 +419,20 @@ def split_sources(raw) -> list[str]:
     for part in _SRC_SPLIT_RE.split(str(raw).strip()):
         p = part.strip(" .;-")
         key = p.lower()
-        if p and key not in seen:      # "Reuters, AFP, Reuters" -> 2 phần tử
+        if p and key not in seen:      # "Reuters, AFP, Reuters" còn 2 phần tử
             seen.add(key)
             out.append(p)
     return out
 
 
 def demote_agency_author(a: Article) -> None:
-    """Chuyển hãng tin / bút danh tòa soạn từ `author_name` sang `source_attribution`.
+    """Dời hãng tin và bút danh toà soạn từ `author_name` sang `source_attribution`.
 
-    Hai cột này mang ngữ nghĩa khác nhau: `author_name` để lọc "bài của nhà báo X",
-    `source_attribution` để biết bài dẫn lại từ đâu. Trộn lẫn thì cả hai bộ lọc
-    đều sai. Gọi sau parse_article, áp cho mọi nguồn.
+    Hai cột mang ngữ nghĩa khác nhau: `author_name` phục vụ câu hỏi "bài của nhà
+    báo X", còn `source_attribution` cho biết bài được dẫn lại từ đâu. Để lẫn thì
+    cả hai phép lọc đều cho kết quả sai.
+
+    Gọi sau `parse_article` và áp dụng cho mọi nguồn.
     """
     name = (a.author_name or "").strip()
     if not name:

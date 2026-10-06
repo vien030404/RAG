@@ -1,18 +1,26 @@
-"""Dọn & chuẩn hóa `bronze.articles` TẠI CHỖ. Chạy tay, KHÔNG nằm trong DAG.
+"""Dọn và chuẩn hoá `bronze.articles` tại chỗ. Chạy thủ công, không nằm trong DAG.
 
-Trước đây việc này nằm ở một bảng riêng (`silver.articles`). Đã gộp vào Bronze vì
-cả ba lý do tồn tại của nó đều đã hết:
+Vì sao không có tầng Silver
+---------------------------
+Pipeline chỉ có một bảng dữ liệu. Ba việc mà một tầng trung gian thường đảm nhận
+đều đã được xử lý ở nơi khác:
 
-  * khử trùng      -> crawl đã idempotent (`storage.known_published_dates`)
-  * lọc chất lượng -> `main.py` đã lọc ngay lúc cào (đo được: 0 dòng bị loại)
-  * cột dẫn xuất   -> nguồn/chuyên mục cố định nên `CATEGORY_MAP` không đổi,
-                      tính luôn trong `storage._to_row`
+    khử trùng       crawl đã idempotent nhờ `storage.known_published_dates`
+    lọc chất lượng  `main.py` lọc ngay lúc cào — đo lại thì không còn dòng nào
+                    bị loại ở bước sau
+    cột dẫn xuất    tập nguồn và chuyên mục cố định nên ánh xạ không đổi, tính
+                    luôn trong `storage._to_row`
 
-Giữ lại script này làm CÔNG CỤ SỬA HỒI TỐ: khi vá parser rồi parse lại HTML thô,
-hoặc khi cần áp lại luật lọc cho dữ liệu cũ, đây là chỗ ghi lại toàn bảng.
+Một bảng Silver trong hoàn cảnh đó chỉ là bản sao thứ hai phải giữ đồng bộ.
 
-QUAN TRỌNG: ghi bằng `overwrite` nên phải chạy khi KHÔNG có crawl nào đang chạy
-(Bronze có 4 task append song song; overwrite cùng lúc sẽ tranh chấp commit).
+Vai trò của module này
+----------------------
+Công cụ sửa hồi tố cho toàn bảng: dùng khi đã vá parser và cần parse lại HTML
+thô, hoặc khi cần áp lại luật lọc cho dữ liệu đã cào từ trước.
+
+Lưu ý khi chạy: module ghi bằng `overwrite`, nên chỉ được chạy lúc không có
+crawl nào hoạt động. Bronze nhận append song song từ nhiều task nguồn, và một
+lệnh overwrite chen vào giữa sẽ tranh chấp commit.
 
     docker compose run --rm --no-deps crawler -m newscrawler.compact
 """
@@ -30,8 +38,9 @@ from .storage import SCHEMA, TABLE_IDENT, _catalog_conn
 DERIVED = ("published_date", "content_len")
 
 
-# Tên chuyên mục ĐÃ GHI SAI ở dữ liệu cũ, tra theo (nguồn, slug hiện tại).
-# Chỉ để migrate; crawl mới lấy thẳng khóa registry nên không dùng tới.
+# Những tên chuyên mục từng bị ghi sai trong dữ liệu cũ, tra theo cặp (nguồn,
+# slug hiện tại). Bảng này chỉ phục vụ việc chuẩn hoá dữ liệu đã có; crawl hiện
+# tại lấy thẳng khoá registry nên không đi qua đây.
 _LEGACY_ALIAS = {
     ("tuoitre", "cong_nghe"): "Nhịp sống số",
 }
@@ -60,9 +69,10 @@ def _to_display_category(tb: pa.Table) -> pa.Array:
     cat = tb.column("category").to_pylist()
     out, miss = [], set()
     for s, c in zip(src, cat):
-        # Tra theo (nguồn, slug) — KHÔNG chỉ theo giá trị, vì cùng một tên có thể
-        # hợp lệ ở báo này mà sai ở báo kia (Tuổi Trẻ từng bị gán "Công nghệ"
-        # trong khi chuyên mục của họ tên là "Nhịp sống số").
+        # Tra theo cặp (nguồn, slug) chứ không chỉ theo giá trị, vì cùng một tên
+        # chuyên mục có thể hợp lệ ở báo này mà sai ở báo khác: "Công nghệ" là
+        # tên đúng ở một số nguồn, nhưng ở Tuổi Trẻ chuyên mục tương ứng mang
+        # tên "Nhịp sống số".
         name = _LEGACY_ALIAS.get((s, _slugify(c))) or m.get((s, _slugify(c))) or m.get((s, c))
         if name is None:
             if c in valid.get(s, ()):     # đã đúng tên của chính nguồn đó
@@ -157,12 +167,14 @@ def build() -> int:
     tb = tb.select([f.name for f in SCHEMA]).cast(SCHEMA)
 
     # --- 4. Mở rộng schema bảng (dòng cũ chưa có 3 cột này) rồi ghi đè --------
-    # .column_names gồm cả tên lồng ('tags.element') -> chỉ xét trường cấp 1,
-    # nếu không delete_column sẽ đòi xóa element type của list và vỡ.
+    # `.column_names` liệt kê cả tên lồng như 'tags.element', nên chỉ xét các
+    # trường cấp một; nếu không, `delete_column` sẽ cố xoá element type của list
+    # và thất bại.
     stale = [f.name for f in table.schema().fields if f.name not in SCHEMA.names]
 
-    # Iceberg KHÔNG cho đổi kiểu cột (string -> list): phải xóa rồi thêm lại.
-    # An toàn vì `tb` đã đọc hết vào RAM và ngay sau đây ghi đè toàn bảng.
+    # Iceberg không cho đổi kiểu một cột từ string sang list, nên phải xoá cột
+    # rồi thêm lại với kiểu mới. Thao tác an toàn ở đây vì `tb` đã đọc toàn bộ
+    # dữ liệu vào bộ nhớ và ngay sau đó ghi đè lại cả bảng.
     fld = next((f for f in table.schema().fields
                 if f.name == "source_attribution"), None)
     if fld is not None and not isinstance(fld.field_type, ListType):

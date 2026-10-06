@@ -1,14 +1,21 @@
-"""Crawler đa nguồn: fetch -> lưu HTML thô (raw) -> parse -> Iceberg Bronze.
+"""Crawler đa nguồn: fetch -> lưu HTML thô -> parse -> Iceberg Bronze.
 
-Phạm vi điều khiển qua env:
-  CRAWL_SOURCES     "vnexpress,tuoitre"  (rỗng = tất cả nguồn)
-  CRAWL_CATEGORIES  "Kinh doanh,Thế giới" (rỗng = tất cả category của nguồn)
-  CRAWL_DATE        "2026-07-02"          (rỗng = HÔM QUA theo giờ VN lúc chạy;
-                                          "all" = không lọc ngày)
+Phạm vi crawl điều khiển qua biến môi trường:
 
-Lọc ngày: chỉ giữ bài ĐÚNG target_date (mới/cũ hơn -> bỏ). Listing xếp mới->cũ
-nhưng hay lẫn bài "nổi bật" ngày cũ, nên KHÔNG dừng vì 1 bài lẻ: chỉ dừng phân
-trang khi cả 1 trang không còn bài nào mới bằng target_date.
+    CRAWL_SOURCES     "vnexpress,tuoitre"    rỗng là lấy mọi nguồn
+    CRAWL_CATEGORIES  "Kinh doanh,Thế giới"  rỗng là lấy mọi chuyên mục
+    CRAWL_DATE        "2026-07-02"           rỗng là ngày hôm trước theo giờ VN
+                                             tại thời điểm chạy; "all" là không
+                                             lọc theo ngày
+
+Cách lọc theo ngày
+------------------
+Chỉ giữ bài đúng `target_date`, bỏ cả bài mới hơn và cũ hơn.
+
+Trang listing xếp từ mới đến cũ, nhưng thường chèn lẫn bài "nổi bật" của những
+ngày trước. Vì vậy một bài lẻ nằm ngoài ngày không được coi là dấu hiệu đã đi
+quá: nó bị bỏ qua, còn vòng phân trang chỉ dừng khi cả một trang không còn bài
+nào mới bằng `target_date`.
 """
 import os
 import re
@@ -81,62 +88,70 @@ def crawl_category(source, name: str, url: str, target_date: date | None,
         )
 
         for link in links:
-            # Đã có trong Bronze (DAG chạy lại cùng ngày) -> khỏi fetch, khỏi
-            # ghi trùng. Vẫn ghi ngày đã biết vào `seen` để logic dừng đúng.
+            # Bài đã có trong Bronze, chẳng hạn khi DAG chạy lại cùng một ngày:
+            # không fetch lại và không ghi trùng. Ngày đã biết vẫn phải đưa vào
+            # `seen` để logic dừng phân trang tính đúng.
             h = md5(link)
             if h in known:
                 seen[link] = known[h]
                 n_known += 1
                 continue
-            seen[link] = None                 # đã xử lý; ngày điền bên dưới nếu parse được
+            seen[link] = None                 # đã xử lý; ngày điền bên dưới nếu parse ra
             art_html, _ = fetch(link)
             if not art_html:
                 print(f"  [skip] fetch lỗi: {link}")
                 continue
 
             art = source.parse_article(art_html, link)
-            # `category` = ĐÚNG TÊN chuyên mục của báo đó (khóa registry, có dấu):
-            # "Thời sự", "Khoa học công nghệ", "Nhịp sống số". Không chuẩn hóa chéo
-            # nguồn vì cùng một tên chưa chắc cùng nội dung (Nhịp sống số của Tuổi
-            # Trẻ ≠ Công nghệ của VietnamNet). `slug` chỉ dùng nội bộ để so khớp.
+            # `category` giữ đúng tên chuyên mục của chính báo đó, có dấu, cũng
+            # là khoá trong registry: "Thời sự", "Khoa học công nghệ", "Nhịp
+            # sống số". Không chuẩn hoá tên chéo giữa các nguồn, vì cùng một tên
+            # chưa chắc cùng nội dung — "Nhịp sống số" của Tuổi Trẻ không tương
+            # đương "Công nghệ" của VietnamNet. `slug` chỉ dùng nội bộ để so khớp.
             art.category = name
             demote_agency_author(art)
 
-            # Bỏ sub_category/topic TRÙNG category (vd crawl nhip-song-so nhưng
-            # breadcrumb "Công nghệ > Nhịp sống số" -> sub = chính category slug).
+            # Bỏ `sub_category` hoặc `topic` nếu chúng trùng với `category`.
+            # Ví dụ: cào chuyên mục nhip-song-so nhưng breadcrumb của bài là
+            # "Công nghệ > Nhịp sống số", khiến sub_category lặp lại chính
+            # category.
             if _slugify(art.sub_category) == slug:
                 art.sub_category, art.topic = art.topic, ""   # đôn cấp sâu hơn lên
             if _slugify(art.topic) == slug:
                 art.topic = ""
 
-            # Chỉ giữ bài text thường: bỏ bài bị đánh dấu (video/megastory/
-            # e-magazine) hoặc không có nội dung text.
+            # Chỉ giữ bài dạng văn bản thường: loại các trang được đánh dấu là
+            # video, megastory hay e-magazine, và các trang parse ra nội dung rỗng.
             if art.crawl_status != "success" or len(art.content) < MIN_CONTENT_LEN:
                 print(f"  [skip] {art.crawl_status} / nội dung ngắn: {link}")
                 continue
 
-            # Lọc theo ngày. Listing xếp mới->cũ NHƯNG hay lẫn bài "nổi bật" ngày
-            # cũ -> KHÔNG dừng vì 1 bài lẻ; chỉ bỏ qua bài ngoài ngày. Việc dừng
-            # phân trang quyết định ở cuối trang (xem newest_on_page bên dưới).
+            # Lọc theo ngày. Một bài lẻ nằm ngoài ngày chỉ bị bỏ qua, không làm
+            # dừng vòng lặp, vì listing thường chèn lẫn bài "nổi bật" của những
+            # ngày trước. Quyết định dừng phân trang nằm ở cuối mỗi trang, dựa
+            # trên `newest_on_page` bên dưới.
             if target_date is not None:
                 d = art.published_at.date() if art.published_at else None
                 seen[link] = d
                 if d is None:
-                    continue                      # không rõ ngày -> bỏ
+                    continue                      # không xác định được ngày
                 if d != target_date:
-                    continue                      # mới/cũ hơn -> bỏ, đọc tiếp
+                    continue                      # ngoài ngày cần lấy, đọc tiếp
 
-            # Qua mọi bộ lọc -> lưu raw (nén) + giữ bài
+            # Qua mọi bộ lọc: lưu HTML thô rồi giữ bài lại cho lượt append.
             try:
                 raw_storage.save_raw_html(source.name, md5(link), art_html)
-            except Exception as e:  # noqa: BLE001 - không để lỗi raw làm hỏng crawl
+            except Exception as e:  # noqa: BLE001 — lỗi lưu raw không làm hỏng crawl
                 print(f"  [raw] lỗi lưu {link}: {e}")
             articles.append(art)
 
-        # Cả trang không còn bài nào mới bằng target_date -> đã phân trang qua hẳn
-        # ngày cần lấy, dừng (chịu được bài "nổi bật" ngày cũ lẻ tẻ vì xét MAX).
-        # Xét MỌI link trên trang (kể cả link trùng đã xử lý ở trang trước, ngày
-        # lấy từ `seen`) để việc bỏ trùng không gây dừng sớm nhầm.
+        # Khi cả trang không còn bài nào mới bằng `target_date`, vòng phân trang
+        # đã đi qua hẳn ngày cần lấy và có thể dừng. Điều kiện xét trên bài mới
+        # nhất của trang nên vẫn chịu được những bài "nổi bật" ngày cũ nằm lẫn.
+        #
+        # Phép xét lấy mọi link trên trang, kể cả link đã xử lý ở trang trước và
+        # lấy ngày từ `seen`. Nếu chỉ xét link mới thì việc bỏ trùng có thể làm
+        # trang trông như không còn bài nào trong ngày và gây dừng sớm.
         page_dates = [seen.get(l) for l in page_links]
         page_dates = [d for d in page_dates if d is not None]
         newest_on_page = max(page_dates) if page_dates else None
@@ -146,9 +161,10 @@ def crawl_category(source, name: str, url: str, target_date: date | None,
         if stop:
             break
     else:
-        # Vòng lặp hết page_urls mà CHƯA từng "đã qua target" -> có thể bị cắt cụt:
-        # bài mới hơn target (vd hôm nay) nhiều tới mức lấp kín MAX_PAGES trước khi
-        # phân trang tới hết ngày target. Cảnh báo để không âm thầm thiếu bài.
+        # Duyệt hết `page_urls` mà chưa lần nào đi qua `target_date` nghĩa là kết
+        # quả có thể bị cắt cụt: số bài mới hơn ngày cần lấy nhiều tới mức lấp
+        # kín MAX_PAGES trang trước khi phân trang tới hết ngày đó. In cảnh báo
+        # để trường hợp thiếu bài không diễn ra âm thầm.
         if target_date is not None and not stop:
             print(
                 f"[{source.name}/{name}] ⚠ HẾT {len(page_urls)} trang mà chưa qua "
@@ -175,10 +191,13 @@ def run(sources=None, categories=None, target_date=None) -> int:
         if categories:
             cats = {k: v for k, v in cats.items() if k in categories}
         print(f"\n{'='*60}\nNGUỒN: {src_name}  ({len(cats)} category)\n{'='*60}")
-        # Gom cả nguồn thành 1 batch -> 1 append (1 snapshot) -> ít xung đột
-        # commit khi nhiều task nguồn ghi song song vào cùng bảng.
-        # Đọc 1 lần những gì đã có trong Bronze cho nguồn này -> chống trùng
-        # CHÉO lần chạy (trạng thái trong RAM chỉ chống trùng trong 1 lần chạy).
+        # Gom toàn bộ một nguồn thành một lô rồi append một lần, tạo một snapshot
+        # duy nhất. Càng ít lần commit thì càng ít xung đột khi các task của
+        # nhiều nguồn ghi song song vào cùng bảng.
+        #
+        # Đọc một lần danh sách bài đã có trong Bronze cho nguồn này, để chống
+        # trùng được cả giữa các lượt chạy — trạng thái trong bộ nhớ tiến trình
+        # chỉ chống trùng trong phạm vi một lượt.
         known = storage.known_published_dates(src_name)
         if known:
             print(f"[{src_name}] Bronze đã có {len(known)} bài -> sẽ bỏ qua khi gặp lại")
@@ -190,9 +209,9 @@ def run(sources=None, categories=None, target_date=None) -> int:
         if source_articles:
             saved = storage.save_articles(source_articles)
             total += saved
-            print(f"[{src_name}] Saved {saved} articles (1 snapshot)")
+            print(f"[{src_name}] đã ghi {saved} bài (1 snapshot)")
 
-    print(f"\nDone. Tổng: {total} articles vào bronze.{storage.BRONZE_TABLE}.")
+    print(f"\nXong. Tổng {total} bài vào bronze.{storage.BRONZE_TABLE}.")
     return total
 
 
@@ -205,12 +224,13 @@ if __name__ == "__main__":
 
     date_env = os.getenv("CRAWL_DATE", "").strip()
     if date_env.lower() in ("all", "none"):
-        target = None                              # không lọc ngày (crawl hết)
+        target = None                              # không lọc ngày, cào toàn bộ
     elif date_env:
         target = date.fromisoformat(date_env)
     else:
-        # Mặc định: NGÀY HÔM QUA theo giờ VN tại thời điểm container chạy
-        # (không phụ thuộc logical date của Airflow). VN không có DST -> +7 cố định.
+        # Mặc định lấy ngày hôm trước theo giờ Việt Nam tại thời điểm container
+        # chạy, độc lập với logical date của Airflow. Việt Nam không áp dụng giờ
+        # mùa hè nên độ lệch +7 là cố định.
         _TZ_VN = timezone(timedelta(hours=7))
         target = (datetime.now(_TZ_VN) - timedelta(days=1)).date()
     print(f"target_date = {target or 'ALL'}")

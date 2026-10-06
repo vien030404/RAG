@@ -1,8 +1,10 @@
 """Parser VietnamNet (https://vietnamnet.vn).
 
-Đặc điểm: KHÔNG có meta article:published_time -> parse text `div.publish-date`
-("07/07/2026 09:00 (GMT+07:00)"). meta[name=author] là generic ("VietNamNet
-News") nên lấy tác giả thật từ `div.article-detail-author__main`.
+Hai điểm khác biệt so với các nguồn còn lại. Thứ nhất, trang không có meta
+`article:published_time`, nên ngày giờ phải parse từ text của `div.publish-date`
+ở dạng "07/07/2026 09:00 (GMT+07:00)". Thứ hai, `meta[name=author]` chỉ chứa tên
+toà soạn chứ không phải tên người, nên tác giả thật lấy từ
+`div.article-detail-author__main`.
 """
 from __future__ import annotations
 
@@ -57,9 +59,10 @@ class VietnamNetSource(BaseSource):
         a.tags = split_keywords(meta(soup, name="keywords"))
         self.fill_hierarchy(soup, a)
 
-        # Khối tác giả gồm <span class="name"> + <span class="position"> ("Nhà báo",
-        # "Thầy giáo ở Hương Sơn, Hà Tĩnh"...). Lấy text cả khối sẽ dính liền thành
-        # "Đàm ĐệNhà báo" -> chỉ lấy span.name; chức danh không phải tên tác giả.
+        # Khối tác giả gồm <span class="name"> đi liền <span class="position">,
+        # trong đó position là chức danh như "Nhà báo" hoặc một mô tả dài hơn.
+        # Lấy text của cả khối sẽ nối tên với chức danh thành một chuỗi dính
+        # liền, nên chỉ đọc span.name — chức danh không phải phần của tên.
         block = (soup.select_one("div.article-detail-author__main")
                  or soup.select_one("p.article-detail-author__info"))
         if block is not None:

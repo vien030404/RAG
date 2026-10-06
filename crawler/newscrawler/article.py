@@ -9,34 +9,35 @@ from datetime import datetime, timezone
 
 @dataclass
 class Article:
-    # Identity
+    # Định danh
     url: str
     url_hash: str = ""
     article_id: int | None = None
 
-    # Category
+    # Phân loại
     category: str = ""
     sub_category: str = ""
     topic: str = ""
     tags: list[str] = field(default_factory=list)
 
-    # Content
+    # Nội dung
     title: str = ""
     description: str = ""
     content: str = ""
     word_count: int = 0
     thumbnail_url: str = ""
 
-    # Author
+    # Tác giả
     author_name: str = ""
-    # Mảng, KHÔNG phải chuỗi: 1 bài thường dẫn nhiều hãng ("AFP, Reuters").
+    # Kiểu mảng chứ không phải chuỗi: một bài thường dẫn nhiều hãng cùng lúc
+    # ("AFP, Reuters"), và để nguyên chuỗi thì lọc theo từng hãng sẽ trượt.
     # Gán qua `sources.base.split_sources` để tách sẵn thành phần.
     source_attribution: list[str] = field(default_factory=list)
 
-    # Time
+    # Thời gian
     published_at: datetime | None = None
     crawled_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
-    # Meta
+    # Siêu dữ liệu
     source: str = ""           # "vnexpress" | "vietnamnet" | "tuoitre" | ...
     crawl_status: str = "success"

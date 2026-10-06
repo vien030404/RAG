@@ -1,23 +1,26 @@
-"""Sửa lại NHÃN của những dòng ghi sai cột — parse lại từ HTML thô trên MinIO.
+"""Sửa các cột nhãn bị bóc tách sai, bằng cách parse lại HTML thô trên MinIO.
 
-Vì sao cần: mỗi báo có cấu trúc trang khác nhau, nên heuristic bóc tách đôi khi
-lấy nhầm — đo được trên dữ liệu thật:
+Mỗi báo có cấu trúc trang riêng, nên heuristic bóc tách đôi khi lấy nhầm vùng.
+Ba dạng sai quan sát được trên corpus:
 
-  * vnexpress  : tiêu đề phụ của bài dạng danh sách lọt vào `author_name`
-                 ("Việt quất", "Hay quên, khó tập trung kéo dài")
-  * vietnamnet : tên dính chức danh ("Đàm ĐệNhà báo") do gộp span.name + span.position
-  * tuoitre/dantri/thanhnien : hãng tin & bút danh tòa soạn ("TTXVN", "PV",
-                 "Thông tin dịch vụ") nằm ở `author_name` thay vì `source_attribution`
+    vnexpress    với bài dạng danh sách, tiêu đề phụ lọt vào `author_name`
+    vietnamnet   tên tác giả dính liền chức danh, do span.name và span.position
+                 nằm cạnh nhau và bị gộp mà không có dấu cách
+    tuoitre,     hãng tin và bút danh toà soạn ("TTXVN", "PV", "Thông tin dịch
+    dantri,      vụ") rơi vào `author_name` thay vì `source_attribution`
+    thanhnien
 
-Công cụ này KHÔNG parse lại toàn bảng — chỉ những dòng bị đánh dấu nghi vấn, và
-chỉ ghi đè các cột NHÃN (author_name, source_attribution, sub_category, topic).
-`content` giữ nguyên nên `content_hash` không đổi, embedding không phải làm lại.
+Module không parse lại toàn bảng: chỉ xử lý những dòng bị đánh dấu nghi vấn, và
+chỉ ghi đè bốn cột nhãn (`author_name`, `source_attribution`, `sub_category`,
+`topic`). `content` giữ nguyên nên `content_hash` không đổi và embedding không
+phải tính lại — đây là điều kiện để công cụ dùng được nhiều lần mà không tốn hạn
+mức API.
 
-    python -m newscrawler.repair              # thử: liệt kê dòng sẽ sửa
+    python -m newscrawler.repair              # chạy thử, liệt kê dòng sẽ sửa
     python -m newscrawler.repair --apply      # ghi thật
-    python -m newscrawler.repair --check 40   # đối chứng trên dòng ĐANG ĐÚNG
+    python -m newscrawler.repair --check 40   # đối chứng trên những dòng đang đúng
 
-Chạy khi không có crawl nào đang chạy (ghi bằng `overwrite`).
+Chỉ chạy khi không có crawl nào hoạt động, vì module ghi bằng `overwrite`.
 """
 from __future__ import annotations
 
@@ -31,8 +34,9 @@ from .sources import SOURCES
 from .sources.base import demote_agency_author, split_sources
 from .storage import SCHEMA, TABLE_IDENT, _catalog_conn
 
-# Cột được phép ghi đè. Cố ý KHÔNG đụng content/title/url để không làm hỏng
-# những thứ tầng trên đã dựa vào (content_hash -> embedding).
+# Các cột được phép ghi đè. `content`, `title` và `url` nằm ngoài danh sách một
+# cách có chủ đích: tầng trên đã dựa vào chúng, cụ thể là `content_hash` quyết
+# định chunk nào phải embed lại.
 LABEL_COLS = ("author_name", "source_attribution", "sub_category", "topic")
 
 _AGENCY = {
@@ -43,16 +47,24 @@ _AGENCY = {
 
 
 def _has_glued_words(s: str) -> bool:
-    """"Đàm ĐệNhà báo" — chữ thường dính ngay chữ hoa, dấu hiệu gộp 2 phần tử.
+    """Phát hiện chữ thường nằm liền ngay chữ hoa, dấu hiệu hai phần tử bị gộp.
 
-    KHÔNG dùng dải regex kiểu [a-zà-ỹ][A-ZÀ-Ỹ]: dải À-Ỹ (U+00C0–U+1EF8) bao luôn
-    chữ THƯỜNG tiếng Việt, nên "Hoàng" cũng khớp. Phải dùng islower/isupper.
+    Ví dụ một ô tên tác giả chứa "<tên>Nhà báo" khi span tên và span chức danh
+    nằm cạnh nhau mà không có dấu cách phân tách.
+
+    Không dùng dải regex kiểu `[a-zà-ỹ][A-ZÀ-Ỹ]`: khoảng U+00C0–U+1EF8 chứa cả
+    chữ thường có dấu của tiếng Việt, nên một tên viết đúng như "Hoàng" cũng
+    khớp. Phải so sánh bằng `islower()` và `isupper()`.
     """
     return any(a.islower() and b.isupper() for a, b in zip(s, s[1:]))
 
 
 def _has_lowercase_word(s: str) -> bool:
-    """Tên người Việt viết hoa mọi từ; có từ viết thường -> gần như chắc là câu."""
+    """Phát hiện giá trị là một câu chứ không phải tên người.
+
+    Tên người Việt viết hoa mọi từ, nên sự có mặt của một từ viết thường ở giữa
+    gần như chắc chắn cho thấy ô này đã bị gán nhầm một đoạn văn.
+    """
     return any(w[:1].islower() for w in s.split()[1:])
 
 
@@ -82,13 +94,16 @@ def run(apply: bool = False, check: int = 0) -> int:
     table = catalog.load_table(TABLE_IDENT)
     tb = table.scan().to_arrow()
     cols = {n: tb.column(n).to_pylist() for n in tb.schema.names}
-    # Dữ liệu chưa qua `compact` còn là chuỗi -> đưa về mảng, nếu không mọi dòng
-    # đều "khác" so với parser mới chỉ vì lệch kiểu.
+    # Dữ liệu chưa qua `compact` còn giữ kiểu chuỗi, nên phải đưa về mảng trước
+    # khi so sánh; nếu không thì mọi dòng đều khác kết quả của parser mới chỉ vì
+    # lệch kiểu, chứ không phải vì nội dung sai.
     cols["source_attribution"] = [split_sources(v) for v in cols["source_attribution"]]
 
     idxs = [i for i in range(tb.num_rows) if is_suspect(cols["author_name"][i])]
     if check:
-        # Đối chứng: lấy dòng ĐANG ĐÚNG, parse lại, xem parser mới có làm đổi không.
+        # Phép đối chứng: lấy những dòng hiện đang đúng, parse lại, rồi xem
+        # parser mới có làm chúng đổi không. Giúp phân biệt "sửa được lỗi" với
+        # "gây ra lỗi mới ở nơi vốn ổn".
         ok = [i for i in range(tb.num_rows) if cols["author_name"][i]
               and not is_suspect(cols["author_name"][i])]
         step = max(1, len(ok) // check)
@@ -137,17 +152,19 @@ TEXT_COLS = ("title", "description", "content")
 
 
 def run_content(apply: bool = False) -> int:
-    """Parse lại TOÀN VĂN từ HTML thô — dùng khi vá lỗi bóc tách văn bản.
+    """Parse lại toàn văn từ HTML thô, dùng khi chính nội dung bài bị bóc sai.
 
-    Khác `run()` ở trên: hàm kia cố ý KHÔNG đụng `content` để giữ `content_hash`.
-    Ở đây thì ngược lại — chính `content` mới là thứ sai, nên phải ghi lại và
-    chấp nhận embed lại những chunk bị đổi.
+    Ngược với `run()` ở trên: hàm đó giữ nguyên `content` để `content_hash` không
+    đổi, còn ở đây `content` chính là thứ sai nên phải ghi lại, và chấp nhận
+    embed lại những chunk thay đổi theo.
 
-    Lý do tồn tại: `get_text(strip=True)` nối text các thẻ con mà không chèn dấu
-    cách, nên `<p>thông tấn<b>TASS</b>của Nga</p>` ra "thông tấnTASScủa Nga".
-    Đo được 85% số bài dính ít nhất một chỗ. Đã vá ở `sources.base.inline_text`.
+    Lỗi cần sửa: `get_text(strip=True)` nối text của các thẻ con mà không chèn
+    dấu cách, nên `<p>thông tấn<b>TASS</b>của Nga</p>` cho ra "thông tấnTASScủa
+    Nga". Đo trên corpus thì 85% số bài có ít nhất một chỗ như vậy. Nguyên nhân
+    đã được xử lý ở `sources.base.inline_text`; hàm này chữa phần dữ liệu đã ghi.
 
-    KHÔNG cào lại: HTML thô trên MinIO còn nguyên thẻ, độ phủ 100%.
+    Không cần cào lại các nguồn: HTML thô trên MinIO còn nguyên thẻ và phủ 100%
+    số bài, nên toàn bộ việc sửa diễn ra trên dữ liệu đã có.
     """
     catalog = _catalog_conn()
     table = catalog.load_table(TABLE_IDENT)

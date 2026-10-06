@@ -72,9 +72,10 @@ class VnExpressSource(BaseSource):
         soup = BeautifulSoup(html, "lxml")
         seen: set[str] = set()
         links: list[str] = []
-        # Không khóa cứng vào h3: chuyên mục Khoa học công nghệ dùng h4.title-news
-        # (đo được 44 link h4 + 7 link h3, trong khi Thời sự chỉ có h3 × 50).
-        # Bám vào class .title-news thay vì thẻ heading để phủ mọi biến thể layout.
+        # Không khoá cứng vào thẻ h3: mỗi chuyên mục dùng một cấp heading khác
+        # nhau — đo trên chuyên mục Khoa học công nghệ thấy 44 link trong h4 và 7
+        # link trong h3, còn Thời sự chỉ dùng h3. Bám vào class .title-news phủ
+        # được mọi biến thể layout.
         for tag in soup.select(".title-news a"):
             href = tag.get("href", "")
             if href.startswith(_BASE) and href not in seen and not _is_ad(tag):
@@ -107,11 +108,13 @@ class VnExpressSource(BaseSource):
         author_tag = soup.select_one("p.author_mail strong")
         byline_tag = None
         if not author_tag and body is not None:
-            # Dạng thực tế của VnExpress: đoạn CUỐI bài, CĂN PHẢI, dạng
+            # Dạng byline thực tế của VnExpress nằm ở đoạn cuối bài và căn phải:
             #   <p class="Normal" style="text-align:right"><strong>Tên</strong> (Theo X)</p>
-            # Bám vào text-align:right thay vì "thẻ <strong> cuối cùng" — heuristic
-            # cũ vớ phải tiêu đề phụ của bài dạng danh sách ("Việt quất", "Hay quên,
-            # khó tập trung kéo dài") vốn cũng là <strong> nhưng căn trái.
+            #
+            # Điều kiện nhận dạng bám vào `text-align:right` chứ không bám vào
+            # "thẻ <strong> cuối cùng trong bài": ở những bài dạng danh sách, các
+            # tiêu đề phụ cũng là <strong> nhưng căn trái, và cách nhận dạng theo
+            # vị trí sẽ lấy nhầm chúng làm tên tác giả.
             for tag in reversed(body.find_all("p")):
                 style = (tag.get("style") or "").replace(" ", "").lower()
                 if "text-align:right" not in style:
@@ -121,9 +124,10 @@ class VnExpressSource(BaseSource):
                         and _looks_like_name(txt(strong)):
                     author_tag = strong
                     break
-                # Không có <strong> hợp lệ -> lấy phần TRƯỚC dấu "(" của đoạn byline.
-                # Dạng gặp thật: "Bảo Bảo (Tổng hợp) Ảnh: Bảo Bảo, Anh Chi" — phần
-                # sau là credit ảnh, không phải tác giả.
+                # Không có <strong> hợp lệ thì lấy phần đứng trước dấu "(" của
+                # đoạn byline. Dạng gặp trong dữ liệu là "<Tên> (Tổng hợp) Ảnh:
+                # <tên khác>", trong đó phần sau là credit ảnh chứ không phải
+                # tác giả bài.
                 lead = re.split(r"[(\[]|Ảnh\s*:", tag.get_text(" ", strip=True))[0].strip()
                 if _looks_like_name(lead):
                     a.author_name = lead

@@ -1,15 +1,17 @@
 # ============================================================================
-# News Crawler -> RAG - infrastructure (Docker Compose)
+# Hạ tầng cho pipeline cào tin và hỏi-đáp RAG.
 #
-#   Crawler  ->  MinIO (raw + warehouse)  <-  Iceberg REST Catalog
-#   Postgres (shared metadata: iceberg / airflow)
-#   Airflow (orchestration)
+#   Crawler   ->  MinIO (bucket raw + warehouse)  <-  Iceberg REST Catalog
+#   Postgres  ->  metadata dùng chung cho Iceberg catalog và Airflow
+#   Qdrant    ->  vector store
+#   Trino     ->  truy vấn SQL trên Iceberg
+#   Airflow   ->  điều phối
 #
-# All tunables live in .env (copy from .env.example).
+# Mọi tham số cấu hình nằm trong .env, tạo bằng cách sao chép .env.example.
 # ============================================================================
 
 # ---------------------------------------------------------------------------
-# Shared Airflow definition (LocalExecutor)
+# Khối cấu hình Airflow dùng chung cho scheduler và webserver (LocalExecutor)
 # ---------------------------------------------------------------------------
 x-airflow-common: &airflow-common
   build:
@@ -27,7 +29,7 @@ x-airflow-common: &airflow-common
     AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
     AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session"
-    # Connection details for the data stack, available to DAGs as env vars
+    # Thông tin kết nối tới các thành phần dữ liệu, DAG đọc qua biến môi trường
     LAKEHOUSE_S3_ENDPOINT: http://minio:9000
     LAKEHOUSE_ICEBERG_REST_URI: http://iceberg-rest:8181
     LAKEHOUSE_ICEBERG_WAREHOUSE: s3://${MINIO_WAREHOUSE_BUCKET}/
@@ -35,7 +37,7 @@ x-airflow-common: &airflow-common
     AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
     AWS_REGION: ${AWS_REGION}
     LAKEHOUSE_DOCKER_NETWORK: ${COMPOSE_PROJECT_NAME:-project-1}_lakehouse
-    # RAG — DAG truyền tiếp xuống container embed (task `embed`)
+    # Tham số RAG: DAG truyền tiếp xuống container của task `embed`
     LAKEHOUSE_QDRANT_URL: http://qdrant:6333
     QDRANT_API_KEY: ${QDRANT_API_KEY:-}
     QDRANT_COLLECTION: ${QDRANT_COLLECTION:-news_chunks}
@@ -53,7 +55,7 @@ x-airflow-common: &airflow-common
     - ./airflow/logs:/opt/airflow/logs
     - ./airflow/plugins:/opt/airflow/plugins
     - ./airflow/config:/opt/airflow/config
-    # Lets the DockerOperator launch the crawler as a sibling container.
+    # Cho DockerOperator khởi chạy crawler như một sibling container.
     - /var/run/docker.sock:/var/run/docker.sock
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on:
@@ -64,7 +66,7 @@ x-airflow-common: &airflow-common
 
 services:
   # =========================================================================
-  # Shared metadata store
+  # Kho metadata dùng chung: một Postgres, hai database riêng
   # =========================================================================
   postgres:
     image: postgres:${POSTGRES_VERSION}
@@ -73,7 +75,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: postgres
-      # consumed by ./postgres/init/01-create-databases.sh
+      # được ./postgres/init/01-create-databases.sh đọc khi khởi tạo
       ICEBERG_CATALOG_DB: ${ICEBERG_CATALOG_DB}
       ICEBERG_CATALOG_USER: ${ICEBERG_CATALOG_USER}
       ICEBERG_CATALOG_PASSWORD: ${ICEBERG_CATALOG_PASSWORD}
@@ -95,7 +97,7 @@ services:
     restart: unless-stopped
 
   # =========================================================================
-  # Object storage (S3-compatible)
+  # Object store tương thích S3: chứa cả HTML thô và warehouse của Iceberg
   # =========================================================================
   minio:
     image: minio/minio:${MINIO_VERSION}
@@ -107,14 +109,14 @@ services:
       MINIO_REGION: ${AWS_REGION}
     ports:
       - "${MINIO_API_PORT}:9000"      # S3 API
-      - "${MINIO_CONSOLE_PORT}:9001"  # Web console
+      - "${MINIO_CONSOLE_PORT}:9001"  # giao diện web
     volumes:
       - minio-data:/data
     networks:
       - lakehouse
     restart: unless-stopped
 
-  # Creates buckets once MinIO is reachable, then exits.
+  # Job một lần: tạo các bucket ngay khi MinIO sẵn sàng rồi tự kết thúc.
   minio-init:
     image: minio/mc:${MINIO_MC_VERSION}
     container_name: minio-init
@@ -142,7 +144,7 @@ services:
     restart: "no"
 
   # =========================================================================
-  # Iceberg REST Catalog (JDBC/Postgres backend, MinIO warehouse)
+  # Iceberg REST Catalog: metadata lưu ở Postgres qua JDBC, dữ liệu ở MinIO
   # =========================================================================
   iceberg-rest:
     build:
@@ -176,7 +178,7 @@ services:
     restart: unless-stopped
 
   # =========================================================================
-  # Vector store (RAG) — embeddings của chunk bài báo + metadata để lọc
+  # Vector store: embedding của từng chunk bài báo, kèm payload để lọc
   # =========================================================================
   qdrant:
     image: qdrant/qdrant:${QDRANT_VERSION}
@@ -190,7 +192,7 @@ services:
     volumes:
       - qdrant-data:/qdrant/storage
     healthcheck:
-      # image không có curl/wget -> dùng bash mở TCP socket
+      # Image không có curl hay wget, nên kiểm tra bằng cách mở TCP socket.
       test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/6333'"]
       interval: 15s
       timeout: 5s
@@ -201,9 +203,12 @@ services:
     restart: unless-stopped
 
   # =========================================================================
-  # SQL engine — truy vấn Iceberg bằng SQL chuẩn.
-  # Cắm DBeaver / bất kỳ SQL client nào vào jdbc:trino://localhost:8080
-  # (user bất kỳ, không mật khẩu). Hoặc CLI: docker exec -it trino trino
+  # Engine SQL trên Iceberg. Đọc cùng catalog và cùng bucket với pipeline Python,
+  # và là nơi duy nhất chạy được các thủ tục bảo trì bảng mà PyIceberg không có:
+  # optimize, expire_snapshots, remove_orphan_files.
+  #
+  #   CLI:   docker compose exec trino trino --catalog iceberg --schema bronze
+  #   JDBC:  jdbc:trino://localhost:8080  (chưa bật xác thực)
   # =========================================================================
   trino:
     image: trinodb/trino:${TRINO_VERSION}
@@ -214,7 +219,7 @@ services:
       minio-init:
         condition: service_completed_successfully
     environment:
-      # Đọc bởi trino/etc/catalog/iceberg.properties qua ${ENV:...}
+      # trino/etc/catalog/iceberg.properties đọc hai biến này qua ${ENV:...}
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
     volumes:
@@ -233,9 +238,12 @@ services:
     restart: unless-stopped
 
   # =========================================================================
-  # Ingestion (web crawler -> Iceberg Bronze)
-  # One-shot job. NOT started by `docker compose up` (guarded by a profile).
-  # Run on demand:  docker compose run --rm --no-deps crawler
+  # Crawler: cào báo rồi ghi vào Iceberg Bronze.
+  #
+  # Job chạy một lần, nằm sau một profile nên `docker compose up` không khởi
+  # động nó. Chạy khi cần:
+  #
+  #   docker compose run --rm --no-deps crawler
   # =========================================================================
   crawler:
     build:
@@ -247,7 +255,7 @@ services:
       iceberg-rest:
         condition: service_started
     environment:
-      # Iceberg REST catalog + MinIO warehouse (Bronze table)
+      # Iceberg REST catalog và warehouse trên MinIO (bảng Bronze)
       ICEBERG_REST_URI: http://iceberg-rest:8181
       ICEBERG_WAREHOUSE: s3://${MINIO_WAREHOUSE_BUCKET}/
       MINIO_ENDPOINT: http://minio:9000
@@ -256,7 +264,7 @@ services:
       AWS_REGION: ${AWS_REGION}
       BRONZE_NAMESPACE: bronze
       BRONZE_TABLE: articles
-      # RAG: chunk + embed (Gemini) -> Qdrant
+      # Tầng RAG: chunk, embed rồi ghi sang Qdrant
       #   docker compose run --rm crawler -m newscrawler.embed
       QDRANT_URL: http://qdrant:6333
       QDRANT_API_KEY: ${QDRANT_API_KEY:-}
@@ -271,18 +279,19 @@ services:
       GEMINI_EMBED_MODEL: ${GEMINI_EMBED_MODEL:-gemini-embedding-001}
       GEMINI_CHAT_MODEL: ${GEMINI_CHAT_MODEL:-gemini-flash-latest}
       EMBED_DIM: ${EMBED_DIM:-768}
-      # Raw zone: gzipped source HTML lands here (object store, not Iceberg)
+      # Bucket chứa HTML gốc đã nén gzip — object thường, không phải bảng Iceberg
       RAW_BUCKET: ${MINIO_RAW_BUCKET}
-      # Optional scope control (defaults: all sources, all categories, today):
-      #   CRAWL_SOURCES: "vnexpress,tuoitre"          # comma-separated source names
-      #   CRAWL_CATEGORIES: "Kinh doanh,Thế giới"     # comma-separated category names
-      #   CRAWL_DATE: "2026-07-02"                     # ISO date
+      # Thu hẹp phạm vi cào, đều không bắt buộc. Mặc định: mọi nguồn, mọi
+      # chuyên mục, ngày hôm trước.
+      #   CRAWL_SOURCES: "vnexpress,tuoitre"        # tên nguồn, phẩy ngăn cách
+      #   CRAWL_CATEGORIES: "Kinh doanh,Thế giới"   # tên chuyên mục, phẩy ngăn cách
+      #   CRAWL_DATE: "2026-07-02"                  # ngày dạng ISO, hoặc "all"
     networks:
       - lakehouse
     restart: "no"
 
   # =========================================================================
-  # Giao dien hoi-dap (Streamlit) — cung image voi crawler
+  # Giao diện hỏi-đáp bằng Streamlit, dùng chung image với crawler.
   #   docker compose --profile chat up -d chatbot   ->  http://localhost:8501
   # =========================================================================
   chatbot:
@@ -294,7 +303,7 @@ services:
         condition: service_healthy
       iceberg-rest:
         condition: service_started
-    # ENTRYPOINT cua image la `python`, nen chi can truyen phan con lai.
+    # ENTRYPOINT của image là `python`, nên chỉ cần truyền phần đối số còn lại.
     command:
       - -m
       - streamlit
@@ -333,7 +342,7 @@ services:
     restart: unless-stopped
 
   # =========================================================================
-  # Orchestration (Airflow, LocalExecutor)
+  # Điều phối bằng Airflow với LocalExecutor
   # =========================================================================
   airflow-init:
     <<: *airflow-common
